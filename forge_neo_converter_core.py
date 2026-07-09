@@ -26,6 +26,18 @@ MODELS_JSON = os.path.join(EXTENSION_DIR, "models.json")
 EXTENDED_METADATA_KEYS = ["config", "license", "encrypted_wandb_properties"]
 TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "fp16", "fp32"]
 CONVROT_GROUPSIZE = 256
+FORGE_SENSITIVE_SUBSTRINGS = (
+    "embed",
+    "bias",
+    "norm",
+    "scale",
+    "llm",
+    "first_stage_model",
+    "cond_stage_model",
+    "vae",
+    "text",
+    "time",
+)
 
 PRECISION_RE = re.compile(
     r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int8(?:_convrot)?|nvfp4)(?=[-_.]|$)",
@@ -78,6 +90,28 @@ def build_output_path(out_dir, base_name, target_format):
 
 def format_size(num_bytes):
     return f"{num_bytes / (1024 ** 3):.2f} GB"
+
+
+def encode_quant_config(info):
+    return torch.tensor(list(json.dumps(info).encode("utf-8")), dtype=torch.uint8)
+
+
+def keep_tensor_dtype(tensor):
+    if tensor.dtype in (torch.float32, torch.bfloat16):
+        return tensor.to(dtype=torch.float16)
+    return tensor
+
+
+def can_quantize_weight(key, tensor):
+    if not key.endswith(".weight"):
+        return False
+    if any(name in key for name in FORGE_SENSITIVE_SUBSTRINGS):
+        return False
+    if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    if tensor.ndim != 2:
+        return False
+    return tensor.size(0) % 16 == 0 and tensor.size(1) % 16 == 0
 
 
 def detect_input_format(sd, metadata):
@@ -141,10 +175,6 @@ def dequantize_input(sd, metadata, log=_noop_logger):
             elif v.dtype == torch.int8:
                 raise ValueError(f"int8 weight '{k}' has no '{k}_scale' tensor, cannot dequantize.")
 
-    for k, v in sd.items():
-        if v.dtype in FP8_DTYPES:
-            sd[k] = v.to(torch.bfloat16)
-
     return sd
 
 
@@ -198,16 +228,11 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     input_bytes = os.path.getsize(model_path)
     sd, orig_meta = load_input(model_path, log=log)
 
-    temp_diffusers_meta = {}
+    temp_diffusers_meta = OrderedDict()
     if orig_meta:
-        if "format" in orig_meta:
-            temp_diffusers_meta["format"] = orig_meta["format"]
-        if "modelspec.architecture" in orig_meta:
-            temp_diffusers_meta["modelspec.architecture"] = orig_meta["modelspec.architecture"]
-        if preserve_extended:
-            for key in EXTENDED_METADATA_KEYS:
-                if key in orig_meta:
-                    temp_diffusers_meta[key] = orig_meta[key]
+        for key, value in orig_meta.items():
+            if key != "_quantization_metadata":
+                temp_diffusers_meta[key] = value
 
     input_format = detect_input_format(sd, orig_meta)
     log(f"Original format: {input_format}")
@@ -236,23 +261,25 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 log(f"Progress: {i}/{total}")
 
             if any(name in k for name in blacklist):
-                new_sd[k] = v.to(dtype=torch.bfloat16)
-                counts["kept bf16"] += 1
+                new_sd[k] = keep_tensor_dtype(v)
+                counts["kept"] += 1
                 continue
 
-            if v.ndim == 2 and ".weight" in k:
+            if can_quantize_weight(k, v):
                 base_k_file = k.replace(".weight", "")
                 base_k_meta = base_k_file
 
-                v_tensor = v.to(device=device, dtype=torch.bfloat16)
+                v_tensor = v.to(device=device)
 
                 if target_format == "fp8" or (fp8_layers and any(name in k for name in fp8_layers)):
                     log(f"FP8: {k}")
                     weight_scale = (v_tensor.abs().max() / 448.0).clamp(min=1e-12).float()
                     weight_quantized = ck.quantize_per_tensor_fp8(v_tensor, weight_scale)
                     new_sd[k] = weight_quantized.cpu()
-                    new_sd[f"{base_k_file}.weight_scale"] = weight_scale.to(torch.bfloat16).cpu()
-                    quant_map["layers"][base_k_meta] = {"format": "float8_e4m3fn"}
+                    new_sd[f"{base_k_file}.weight_scale"] = weight_scale.cpu()
+                    layer_conf = {"format": "float8_e4m3fn"}
+                    new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
+                    quant_map["layers"][base_k_meta] = layer_conf
                     counts["fp8"] += 1
                     if device == "cuda":
                         del v_tensor
@@ -294,27 +321,26 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     if convrot:
                         layer_conf["convrot"] = True
                         layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
+                    new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
                     quant_map["layers"][base_k_meta] = layer_conf
                     counts[target_format] += 1
                 except Exception as e:
                     log(f"Warning: quantization failed for {k}: {e}")
-                    new_sd[k] = v.to(dtype=torch.bfloat16)
-                    counts["kept bf16"] += 1
+                    new_sd[k] = keep_tensor_dtype(v)
+                    counts["kept"] += 1
 
                 if device == "cuda":
                     del v_tensor
             else:
-                new_sd[k] = v.to(dtype=torch.bfloat16)
-                counts["kept bf16"] += 1
+                new_sd[k] = keep_tensor_dtype(v)
+                counts["kept"] += 1
 
-    final_metadata = OrderedDict()
+    final_metadata = OrderedDict(temp_diffusers_meta)
     if quant_map["layers"]:
         final_metadata["_quantization_metadata"] = json.dumps(quant_map)
         first_quant_layer = next(iter(quant_map["layers"]))
         log(f"Quantization metadata: {len(quant_map['layers'])} layers, first key: {first_quant_layer}")
     final_metadata["converted_by"] = "Star Ultimate Model Converter"
-    for k, v in temp_diffusers_meta.items():
-        final_metadata[k] = v
 
     log(f"Saving | Type: {model_type} | Path: {output_path}")
     safetensors.torch.save_file(new_sd, output_path, metadata=final_metadata)

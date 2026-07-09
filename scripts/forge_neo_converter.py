@@ -4,7 +4,8 @@ import traceback
 
 import gradio as gr
 
-from modules import call_queue, paths, script_callbacks, shared
+from modules import call_queue, paths, script_callbacks, shared, ui
+from modules.ui_components import ToolButton
 
 
 EXTENSION_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -81,19 +82,18 @@ def resolve_model_path(model_name):
 
 
 def run_conversion(model_name, model_type, target_format, device):
-    logs = []
-
     def log(message):
-        logs.append(str(message))
         print(f"[Forge Neo Converter] {message}")
 
     try:
         model_path = resolve_model_path(model_name)
-        convert_model(model_path, model_type, target_format, device, log=log)
+        status, _ = convert_model(model_path, model_type, target_format, device, log=log)
+        return status
     except Exception as e:
         log(f"Error: {e}")
-        log(traceback.format_exc())
-    return "\n".join(logs)
+        details = traceback.format_exc()
+        log(details)
+        return f"Error: {e}\n\n{details}"
 
 
 def refreshed_model_args():
@@ -122,9 +122,10 @@ def create_converter_tab():
                         elem_id="forge_neo_converter_model_name",
                         scale=8,
                     )
-                    refresh_models = gr.Button(
-                        value="Refresh",
+                    refresh_models = ToolButton(
+                        value=ui.refresh_symbol,
                         elem_id="forge_neo_converter_refresh_models",
+                        tooltip="Refresh model list",
                         scale=1,
                     )
 
