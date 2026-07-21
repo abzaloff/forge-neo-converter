@@ -41,8 +41,8 @@
       "preserve_extended_metadata": false
     },
     "Ideogram-4": {
-      "_note": "Diffusion Transformer using flow matching. Crucial to preserve embedding and output mapping layers.",
-      "blacklist": ["bias", "norm", "scale", "final_layer", "proj_out", "x_embedder", "t_embedder", "context_embedder", "text_embedding", "time_embedding"],
+      "_note": "Diffusion Transformer using flow matching. Crucial to preserve embedding, output mapping, QK-RMSNorm, and modulation layers to maintain INT4 quality.",
+      "blacklist": ["bias", "norm", "scale", "final_layer", "proj_out", "x_embedder", "t_embedder", "context_embedder", "text_embedding", "time_embedding", "modulation", "adaLN", "q_norm", "k_norm", "img_in", "txt_in", "time_in", "vector_in", "guidance_in", "single_stream_modulation", "embed_image_indicator", "embed_text_indicator", "adaln_proj", "input_proj", "llm_cond_proj", "t_embedding"],
       "fp8_layers": [],
       "preserve_extended_metadata": false
     },
@@ -73,6 +73,24 @@
     "SDXL (Not NVFP4)": {
       "_note": "Standard preservation layers for SDXL mixed precision models.",
       "blacklist": ["time_embed", "label_emb", "add_time_embed", "add_embed", "out", "bias", "norm"],
+      "fp8_layers": [],
+      "preserve_extended_metadata": false
+    },
+    "SeedVR (All Versions)": {
+      "_note": "Groups SeedVR and SeedVR2. Protects positional/patch embeddings and modulations to prevent structural artifacts.",
+      "blacklist": ["bias", "norm", "scale", "final_layer", "proj_out", "pos_emb", "neg_emb", "patch_embed", "pos_embed", "x_embedder", "t_embedder", "context_embedder", "y_embedder", "time_in", "vector_in", "guidance_in", "txt_in", "img_in", "single_stream_modulation", "double_stream_modulation", "vae", "attn.proj_qkv_vid"],
+      "fp8_layers": [],
+      "preserve_extended_metadata": false
+    },
+    "Text-Encoder": {
+      "_note": "Generic profile for text encoders such as CLIP, T5, and Llama.",
+      "blacklist": ["bias", "norm", "scale", "token_embedding", "position_embedding", "shared.weight", "lm_head", "final_layer_norm", "embed_tokens", "text_model.embeddings", "pos_embed", "patch_embed"],
+      "fp8_layers": [],
+      "preserve_extended_metadata": false
+    },
+    "Unknown": {
+      "_note": "Conservative universal fallback for unfamiliar architectures.",
+      "blacklist": ["bias", "norm", "scale", "final_layer", "proj_out", "head", "text_embedding", "time_embedding", "time_projection", "embedder", "adaln", "t_embedder", "x_embedder", "y_embedder", "context_embedder", "pos_emb", "patch_embed", "pos_embed", "class_embedding", "single_stream_modulation", "double_stream_modulation", "img_in", "txt_in", "time_in", "vector_in", "guidance_in"],
       "fp8_layers": [],
       "preserve_extended_metadata": false
     },

@@ -46,10 +46,11 @@ This Forge Neo extension ports that workflow into a native Forge Neo tab and adj
 - `mxfp8`
 - `int8`
 - `int8_convrot`
+- `int4_convrot` — ConvRot W4A4 quantization with 4-bit weights and group-wise scales.
 - `fp16`
 - `fp32`
 
-Quantized formats require `comfy-kitchen`.
+Quantized formats require `comfy-kitchen`. `int4_convrot` additionally requires a current Forge Neo/comfy-kitchen build that provides the ConvRot W4A4 layout.
 
 ## Model Search Paths
 

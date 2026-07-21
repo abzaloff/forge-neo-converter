@@ -11,21 +11,28 @@ import torch
 try:
     import comfy_kitchen as ck
     from comfy_kitchen.registry import registry as ck_registry
-    from comfy_kitchen.tensor import TensorCoreMXFP8Layout, TensorCoreNVFP4Layout, TensorWiseINT8Layout
+    from comfy_kitchen.tensor import (
+        TensorCoreConvRotW4A4Layout,
+        TensorCoreMXFP8Layout,
+        TensorCoreNVFP4Layout,
+        TensorWiseINT8Layout,
+    )
 except ImportError:
     ck = None
     ck_registry = None
     TensorCoreMXFP8Layout = None
     TensorCoreNVFP4Layout = None
     TensorWiseINT8Layout = None
+    TensorCoreConvRotW4A4Layout = None
 
 
 EXTENSION_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_JSON = os.path.join(EXTENSION_DIR, "models.json")
 
 EXTENDED_METADATA_KEYS = ["config", "license", "encrypted_wandb_properties"]
-TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "fp16", "fp32"]
+TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "int4_convrot", "fp16", "fp32"]
 CONVROT_GROUPSIZE = 256
+INT4_QUANT_GROUPSIZE = 64
 FORGE_SENSITIVE_SUBSTRINGS = (
     "embed",
     "bias",
@@ -40,7 +47,7 @@ FORGE_SENSITIVE_SUBSTRINGS = (
 )
 
 PRECISION_RE = re.compile(
-    r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int8(?:_convrot)?|nvfp4)(?=[-_.]|$)",
+    r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int[48](?:_convrot)?|nvfp4)(?=[-_.]|$)",
     re.IGNORECASE,
 )
 
@@ -149,9 +156,9 @@ def dequantize_input(sd, metadata, log=_noop_logger):
 
     for layer, info in quant_layers.items():
         fmt = info.get("format")
-        if fmt in ("nvfp4", "mxfp8"):
+        if fmt in ("nvfp4", "mxfp8", "convrot_w4a4"):
             raise ValueError(f"Input model contains {fmt} layers ('{layer}'), which cannot be dequantized losslessly. Use a higher precision source model.")
-        if info.get("convrot"):
+        if info.get("convrot") and fmt != "convrot_w4a4":
             raise ValueError(f"Input model contains ConvRot-rotated INT8 layers ('{layer}'). Use a higher precision source model.")
 
     if "scaled_fp8" in sd:
@@ -201,6 +208,8 @@ def _require_quantization_deps(target_format):
         return
     if ck is None:
         raise RuntimeError("comfy-kitchen is not installed. Install extension requirements before using quantized target formats.")
+    if target_format == "int4_convrot" and TensorCoreConvRotW4A4Layout is None:
+        raise RuntimeError("This comfy-kitchen version does not support int4_convrot. Update Forge Neo/comfy-kitchen first.")
 
 
 def convert_model(model_path, model_type, target_format, device, log=_noop_logger):
@@ -269,14 +278,16 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 base_k_file = k.replace(".weight", "")
                 base_k_meta = base_k_file
 
-                v_tensor = v.to(device=device)
+                # Current Forge kitchen kernels accept FP16/BF16 input only.  Keeping
+                # this tensor in BF16 also avoids creating a large FP32 copy per layer.
+                v_tensor = v.to(device=device, dtype=torch.bfloat16)
 
                 if target_format == "fp8" or (fp8_layers and any(name in k for name in fp8_layers)):
                     log(f"FP8: {k}")
                     weight_scale = (v_tensor.abs().max() / 448.0).clamp(min=1e-12).float()
                     weight_quantized = ck.quantize_per_tensor_fp8(v_tensor, weight_scale)
                     new_sd[k] = weight_quantized.cpu()
-                    new_sd[f"{base_k_file}.weight_scale"] = weight_scale.cpu()
+                    new_sd[f"{base_k_file}.weight_scale"] = weight_scale.to(torch.bfloat16).cpu()
                     layer_conf = {"format": "float8_e4m3fn"}
                     new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
                     quant_map["layers"][base_k_meta] = layer_conf
@@ -285,10 +296,14 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                         del v_tensor
                     continue
 
-                convrot = target_format == "int8_convrot"
+                int8_convrot = target_format == "int8_convrot"
+                int4_convrot = target_format == "int4_convrot"
                 if target_format in ("int8", "int8_convrot"):
                     layout = TensorWiseINT8Layout
                     fmt_name = "int8_tensorwise"
+                elif int4_convrot:
+                    layout = TensorCoreConvRotW4A4Layout
+                    fmt_name = "convrot_w4a4"
                 elif target_format == "mxfp8":
                     layout = TensorCoreMXFP8Layout
                     fmt_name = "mxfp8"
@@ -297,10 +312,20 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     fmt_name = "nvfp4"
                 log(f"{target_format.upper()}: {k}")
 
+                qdata = params = tensors = v_tensor_ready = None
                 try:
-                    v_tensor_ready = v_tensor.float().contiguous()
-                    if convrot:
+                    # Do not cast to float32 here: recent Forge kernels reject it
+                    # ("Unsupported dtype code: 0") and the temporary FP32 copy can
+                    # exhaust VRAM on large DiTs.
+                    v_tensor_ready = v_tensor.contiguous()
+                    if int8_convrot:
                         qdata, params = layout.quantize(v_tensor_ready, per_channel=True, convrot=True, convrot_groupsize=CONVROT_GROUPSIZE)
+                    elif int4_convrot:
+                        qdata, params = layout.quantize(
+                            v_tensor_ready,
+                            convrot_groupsize=CONVROT_GROUPSIZE,
+                            quant_group_size=INT4_QUANT_GROUPSIZE,
+                        )
                     elif mxfp8_backend is not None:
                         with ck_registry.use_backend(mxfp8_backend):
                             qdata, params = layout.quantize(v_tensor_ready)
@@ -318,9 +343,12 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                             new_sd[out_key] = tensor.cpu()
 
                     layer_conf = {"format": fmt_name}
-                    if convrot:
+                    if int8_convrot:
                         layer_conf["convrot"] = True
                         layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
+                    elif int4_convrot:
+                        layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
+                        layer_conf["quant_group_size"] = INT4_QUANT_GROUPSIZE
                     new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
                     quant_map["layers"][base_k_meta] = layer_conf
                     counts[target_format] += 1
@@ -329,8 +357,12 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     new_sd[k] = keep_tensor_dtype(v)
                     counts["kept"] += 1
 
+                # Explicitly drop all CUDA temporaries before the next layer.  The
+                # quantization layouts can allocate several working buffers, so
+                # retaining one iteration is enough to OOM a 16 GB GPU.
+                del qdata, params, tensors, v_tensor_ready, v_tensor
                 if device == "cuda":
-                    del v_tensor
+                    torch.cuda.empty_cache()
             else:
                 new_sd[k] = keep_tensor_dtype(v)
                 counts["kept"] += 1

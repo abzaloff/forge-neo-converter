@@ -3,6 +3,7 @@ import sys
 import traceback
 
 import gradio as gr
+import torch
 
 from modules import call_queue, paths, script_callbacks, shared, ui
 from modules.ui_components import ToolButton
@@ -94,6 +95,11 @@ def run_conversion(model_name, model_type, target_format, device):
         details = traceback.format_exc()
         log(details)
         return f"Error: {e}\n\n{details}"
+    finally:
+        # The converter uses large temporary CUDA buffers.  Forge otherwise keeps
+        # them cached after this queued job, which can make the next generation OOM.
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def refreshed_model_args():
