@@ -70,6 +70,10 @@ It also scans directories passed to Forge Neo with:
 
 If models are added while Forge Neo is already running, click **Refresh** in the Converter tab.
 
+Model folders are scanned recursively, including nested symbolic links and
+Windows directory junctions. Repeated targets and cyclic directory links are
+detected and skipped.
+
 ## Installation
 
 Clone or copy this repository into your Forge Neo `extensions` directory:

@@ -58,8 +58,15 @@ def _short_name(path, roots):
 def list_model_choices():
     roots = _candidate_model_dirs()
     found = []
+    visited_dirs = set()
     for root in roots:
-        for current_root, _dirs, files in os.walk(root):
+        for current_root, dirs, files in os.walk(root, followlinks=True):
+            real_root = os.path.normcase(os.path.realpath(current_root))
+            if real_root in visited_dirs:
+                dirs[:] = []
+                continue
+            visited_dirs.add(real_root)
+
             for filename in files:
                 if filename.lower().endswith(MODEL_EXTENSIONS):
                     found.append(os.path.join(current_root, filename))
