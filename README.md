@@ -1,16 +1,13 @@
 # Forge Neo Converter
 
-Forge Neo Converter is a Forge Neo extension for converting `.safetensors` diffusion model files between precision and quantization formats directly from the Forge UI.
+Forge Neo Converter is a Forge Neo extension for converting `.safetensors` diffusion models and text encoders between precision and quantization formats directly from the Forge UI.
 
-It adds a top-level **Converter** tab with controls for:
+It adds a top-level **Converter** tab with two modes:
 
-- model file
-- model architecture profile
-- target format
-- conversion device
-- conversion log output
+- **Model mode** scans diffusion model/checkpoint folders and lets you choose an architecture profile.
+- **Text encoder mode** scans Forge text encoder folders and automatically uses the protected `Text-Encoder` profile.
 
-Converted models are saved next to the selected source model. The output name follows the same naming behavior as the source converter: an existing precision suffix is stripped when detected, then the selected target format is appended.
+Converted files are saved next to the selected source file. The output name follows the same naming behavior as the source converter: an existing precision suffix is stripped when detected, then the selected target format is appended.
 
 Example:
 
@@ -32,12 +29,14 @@ This Forge Neo extension ports that workflow into a native Forge Neo tab and adj
 ## Features
 
 - Top-level **Converter** tab in Forge Neo.
-- Converts `.safetensors` model files in place.
-- Saves converted models in the same directory as the selected source model.
+- Separate **Model mode** and **Text encoder mode** tabs.
+- Converts `.safetensors` diffusion model and text encoder files in place.
+- Saves converted files in the same directory as the selected source.
 - Supports architecture-specific model profiles from the original Starnodes converter.
+- Automatically protects text encoder embeddings, normalization layers, biases, and output heads in BF16.
 - Supports Forge Neo-compatible mixed precision metadata.
 - Shows a text log for conversion progress, layer statistics, output path, and errors.
-- Scans standard Forge model folders and configured checkpoint directories.
+- Scans standard Forge model/text encoder folders and their configured extra directories.
 
 ## Supported Target Formats
 
@@ -52,9 +51,9 @@ This Forge Neo extension ports that workflow into a native Forge Neo tab and adj
 
 Quantized formats require `comfy-kitchen`. `int4_convrot` additionally requires a current Forge Neo/comfy-kitchen build that provides the ConvRot W4A4 layout.
 
-## Model Search Paths
+## Search Paths
 
-The model dropdown scans `.safetensors` files from:
+In **Model mode**, the dropdown scans `.safetensors` files from:
 
 ```text
 models/diffusion_models
@@ -68,9 +67,25 @@ It also scans directories passed to Forge Neo with:
 --ckpt-dir
 ```
 
-If models are added while Forge Neo is already running, click **Refresh** in the Converter tab.
+In **Text encoder mode**, the dropdown scans:
 
-Model folders are scanned recursively, including nested symbolic links and
+```text
+models/text_encoder
+models/text_encoders
+models/clip
+```
+
+It also scans directories configured with:
+
+```text
+--text-encoder-dirs
+```
+
+The singular `models/text_encoder` directory is Forge Neo's native text encoder folder; the other names support shared ComfyUI-compatible layouts.
+
+If files are added while Forge Neo is already running, click the refresh button in the corresponding mode.
+
+Source folders are scanned recursively, including nested symbolic links and
 Windows directory junctions. Repeated targets and cyclic directory links are
 detected and skipped.
 
@@ -97,8 +112,8 @@ Restart Forge Neo completely after installation.
 
 1. Start Forge Neo.
 2. Open the **Converter** tab.
-3. Select a `.safetensors` model from the dropdown.
-4. Select the matching model type/profile.
+3. Open **Model mode** or **Text encoder mode**.
+4. Select a `.safetensors` source file. In Model mode, also select the matching model type/profile.
 5. Select the target format.
 6. Select `cuda` or `cpu`.
 7. Click **Convert**.
@@ -145,7 +160,7 @@ See [requirements.txt](requirements.txt).
 
 The model profile data used by this extension is kept in [models.json](models.json). It is adapted from the upstream Starnodes Model Converter profile definitions.
 
-Only the converter workflow is exposed in Forge Neo. The additional ComfyUI-only node UI and optional AIO splitter controls are not exposed in the Forge Neo tab.
+Only the standalone model and text encoder converter workflows are exposed in Forge Neo. The additional ComfyUI-only node UI and optional AIO splitter controls are not exposed in the Forge Neo tab.
 
 ## License
 

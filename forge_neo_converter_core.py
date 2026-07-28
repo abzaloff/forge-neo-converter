@@ -31,6 +31,7 @@ MODELS_JSON = os.path.join(EXTENSION_DIR, "models.json")
 
 EXTENDED_METADATA_KEYS = ["config", "license", "encrypted_wandb_properties"]
 TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "int4_convrot", "fp16", "fp32"]
+TEXT_ENCODER_PROFILE = "Text-Encoder"
 CONVROT_GROUPSIZE = 256
 INT4_QUANT_GROUPSIZE = 64
 FORGE_SENSITIVE_SUBSTRINGS = (
@@ -109,10 +110,16 @@ def keep_tensor_dtype(tensor):
     return tensor
 
 
-def can_quantize_weight(key, tensor):
+def preserve_tensor(tensor, source_kind):
+    if source_kind == "text_encoder" and tensor.dtype.is_floating_point:
+        return tensor.to(dtype=torch.bfloat16), "kept bf16"
+    return keep_tensor_dtype(tensor), "kept"
+
+
+def can_quantize_weight(key, tensor, protected_substrings=FORGE_SENSITIVE_SUBSTRINGS):
     if not key.endswith(".weight"):
         return False
-    if any(name in key for name in FORGE_SENSITIVE_SUBSTRINGS):
+    if any(name in key for name in protected_substrings):
         return False
     if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
@@ -212,11 +219,13 @@ def _require_quantization_deps(target_format):
         raise RuntimeError("This comfy-kitchen version does not support int4_convrot. Update Forge Neo/comfy-kitchen first.")
 
 
-def convert_model(model_path, model_type, target_format, device, log=_noop_logger):
+def convert_model(model_path, model_type, target_format, device, log=_noop_logger, source_kind="model"):
     if not model_path:
         raise ValueError("No model selected.")
     if not os.path.isfile(model_path):
         raise ValueError(f"Model file not found: {model_path}")
+    if source_kind not in ("model", "text_encoder"):
+        raise ValueError(f"Unsupported source kind: {source_kind}")
     if target_format not in TARGET_FORMATS:
         raise ValueError(f"Unsupported target format: {target_format}")
     if device == "cuda" and not torch.cuda.is_available():
@@ -225,13 +234,16 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     _require_quantization_deps(target_format)
 
     configs = load_model_configs()
-    blacklist, fp8_layers, preserve_extended = get_profile(configs, model_type)
+    active_model_type = TEXT_ENCODER_PROFILE if source_kind == "text_encoder" else model_type
+    blacklist, fp8_layers, preserve_extended = get_profile(configs, active_model_type)
+    protected_substrings = () if source_kind == "text_encoder" else FORGE_SENSITIVE_SUBSTRINGS
+    source_label = "Text encoder" if source_kind == "text_encoder" else "Model"
     start_time = time.time()
     out_dir = os.path.dirname(model_path)
     base_name = os.path.splitext(os.path.basename(model_path))[0]
     output_path = build_output_path(out_dir, base_name, target_format)
 
-    log(f"Star Ultimate Model Converter profile: {model_type} | target: {target_format}")
+    log(f"{source_label} conversion profile: {active_model_type} | target: {target_format}")
     log(f"Converting on: {device}")
 
     input_bytes = os.path.getsize(model_path)
@@ -270,11 +282,11 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 log(f"Progress: {i}/{total}")
 
             if any(name in k for name in blacklist):
-                new_sd[k] = keep_tensor_dtype(v)
-                counts["kept"] += 1
+                new_sd[k], count_name = preserve_tensor(v, source_kind)
+                counts[count_name] += 1
                 continue
 
-            if can_quantize_weight(k, v):
+            if can_quantize_weight(k, v, protected_substrings=protected_substrings):
                 base_k_file = k.replace(".weight", "")
                 base_k_meta = base_k_file
 
@@ -354,8 +366,8 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     counts[target_format] += 1
                 except Exception as e:
                     log(f"Warning: quantization failed for {k}: {e}")
-                    new_sd[k] = keep_tensor_dtype(v)
-                    counts["kept"] += 1
+                    new_sd[k], count_name = preserve_tensor(v, source_kind)
+                    counts[count_name] += 1
 
                 # Explicitly drop all CUDA temporaries before the next layer.  The
                 # quantization layouts can allocate several working buffers, so
@@ -364,8 +376,8 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 if device == "cuda":
                     torch.cuda.empty_cache()
             else:
-                new_sd[k] = keep_tensor_dtype(v)
-                counts["kept"] += 1
+                new_sd[k], count_name = preserve_tensor(v, source_kind)
+                counts[count_name] += 1
 
     final_metadata = OrderedDict(temp_diffusers_meta)
     if quant_map["layers"]:
@@ -374,7 +386,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
         log(f"Quantization metadata: {len(quant_map['layers'])} layers, first key: {first_quant_layer}")
     final_metadata["converted_by"] = "Star Ultimate Model Converter"
 
-    log(f"Saving | Type: {model_type} | Path: {output_path}")
+    log(f"Saving | Type: {active_model_type} | Path: {output_path}")
     safetensors.torch.save_file(new_sd, output_path, metadata=final_metadata)
 
     output_bytes = os.path.getsize(output_path)
@@ -383,7 +395,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     layers_desc = ", ".join(f"{n} {name}" for name, n in counts.most_common())
     status = "\n".join(
         [
-            f"Success ({model_type} -> {target_format})",
+            f"Success ({active_model_type} -> {target_format})",
             f"Input: {os.path.basename(model_path)}",
             f"Original format: {input_format}",
             f"Original size: {format_size(input_bytes)}",
@@ -395,3 +407,16 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     )
     log(status)
     return status, output_path
+
+
+def convert_text_encoder(model_path, target_format, device, log=_noop_logger):
+    if not model_path:
+        raise ValueError("No text encoder selected.")
+    return convert_model(
+        model_path,
+        TEXT_ENCODER_PROFILE,
+        target_format,
+        device,
+        log=log,
+        source_kind="text_encoder",
+    )
