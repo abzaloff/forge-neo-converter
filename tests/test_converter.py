@@ -30,6 +30,29 @@ class DummyInt8Layout:
         return {"": qdata, "_scale": params}
 
 
+class DummyW4A8Layout:
+    quantize_kwargs = None
+
+    @classmethod
+    def quantize(cls, tensor, **kwargs):
+        cls.quantize_kwargs = kwargs
+        qdata = tensor[:, ::2].to(torch.int8)
+        params = {
+            "s_rel": torch.ones(
+                tensor.size(0),
+                tensor.size(1) // kwargs["group_size"],
+                dtype=torch.float32,
+                device=tensor.device,
+            ),
+            "s_channel": torch.ones(tensor.size(0), dtype=torch.float32, device=tensor.device),
+        }
+        return qdata, params
+
+    @staticmethod
+    def state_dict_tensors(qdata, params):
+        return {"": qdata, "_s_rel": params["s_rel"], "_s_channel": params["s_channel"]}
+
+
 class CoreTests(unittest.TestCase):
     def test_text_encoder_weights_are_not_blocked_by_text_prefix(self):
         tensor = torch.zeros((16, 16), dtype=torch.float16)
@@ -65,6 +88,55 @@ class CoreTests(unittest.TestCase):
                 metadata = handle.metadata()
             quantization = json.loads(metadata["_quantization_metadata"])
             self.assertIn("text_model.encoder.layers.0.mlp.fc1", quantization["layers"])
+
+    def test_w4a8_convrot_uses_asym_layout_and_forge_metadata(self):
+        state_dict = {
+            "model.diffusion_model.blocks.1.attn.proj.weight": torch.ones(
+                (256, 256), dtype=torch.float16
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-fp16.safetensors")
+            safetensors.torch.save_file(state_dict, source)
+            logs = []
+
+            with (
+                mock.patch.object(core, "ck", object()),
+                mock.patch.object(core, "AsymW4A8Int8Layout", DummyW4A8Layout),
+            ):
+                _, output = core.convert_model(
+                    source,
+                    "Other/Unknown",
+                    "w4a8_convrot",
+                    "cpu",
+                    log=logs.append,
+                )
+
+            self.assertEqual(os.path.basename(output), "model-w4a8_convrot.safetensors")
+            converted = safetensors.torch.load_file(output)
+            layer = "model.diffusion_model.blocks.1.attn.proj"
+            self.assertIn(f"{layer}.weight_s_rel", converted, logs)
+            self.assertIn(f"{layer}.weight_s_channel", converted)
+            self.assertIn(f"{layer}.comfy_quant", converted)
+            self.assertEqual(DummyW4A8Layout.quantize_kwargs["group_size"], 16)
+            self.assertEqual(DummyW4A8Layout.quantize_kwargs["convrot_groupsize"], 256)
+            self.assertEqual(
+                DummyW4A8Layout.quantize_kwargs["scale_dtype"],
+                torch.float8_e4m3fn,
+            )
+
+            with safetensors.safe_open(output, framework="pt") as handle:
+                metadata = handle.metadata()
+            quantization = json.loads(metadata["_quantization_metadata"])
+            self.assertEqual(
+                quantization["layers"][layer],
+                {
+                    "format": "asym_w4a8_int8",
+                    "group_size": 16,
+                    "convrot_groupsize": 256,
+                },
+            )
 
 
 class UiTests(unittest.TestCase):
@@ -163,6 +235,7 @@ class UiTests(unittest.TestCase):
 
             self.assertTrue(hasattr(module.converter_core, "convert_text_encoder"))
             self.assertEqual(module.TEXT_ENCODER_PROFILE, "Text-Encoder")
+            self.assertIn("w4a8_convrot", module.TARGET_FORMATS)
 
 
 if __name__ == "__main__":

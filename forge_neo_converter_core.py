@@ -25,15 +25,21 @@ except ImportError:
     TensorWiseINT8Layout = None
     TensorCoreConvRotW4A4Layout = None
 
+try:
+    from comfy_kitchen.tensor import AsymW4A8Int8Layout
+except ImportError:
+    AsymW4A8Int8Layout = None
+
 
 EXTENSION_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_JSON = os.path.join(EXTENSION_DIR, "models.json")
 
 EXTENDED_METADATA_KEYS = ["config", "license", "encrypted_wandb_properties"]
-TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "int4_convrot", "fp16", "fp32"]
+TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "int4_convrot", "w4a8_convrot", "fp16", "fp32"]
 TEXT_ENCODER_PROFILE = "Text-Encoder"
 CONVROT_GROUPSIZE = 256
 INT4_QUANT_GROUPSIZE = 64
+W4A8_QUANT_GROUPSIZE = 16
 FORGE_SENSITIVE_SUBSTRINGS = (
     "embed",
     "bias",
@@ -48,7 +54,7 @@ FORGE_SENSITIVE_SUBSTRINGS = (
 )
 
 PRECISION_RE = re.compile(
-    r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int[48](?:_convrot)?|nvfp4)(?=[-_.]|$)",
+    r"[-_.](fp32|fp16|bf16|mxfp8|fp8(?:_e[45]m[23](?:fn)?)?(?:_scaled)?(?:_fast)?|int[48](?:_convrot)?|w4a[48]_convrot|nvfp4)(?=[-_.]|$)",
     re.IGNORECASE,
 )
 
@@ -116,7 +122,7 @@ def preserve_tensor(tensor, source_kind):
     return keep_tensor_dtype(tensor), "kept"
 
 
-def can_quantize_weight(key, tensor, protected_substrings=FORGE_SENSITIVE_SUBSTRINGS):
+def can_quantize_weight(key, tensor, protected_substrings=FORGE_SENSITIVE_SUBSTRINGS, alignment=16):
     if not key.endswith(".weight"):
         return False
     if any(name in key for name in protected_substrings):
@@ -125,7 +131,7 @@ def can_quantize_weight(key, tensor, protected_substrings=FORGE_SENSITIVE_SUBSTR
         return False
     if tensor.ndim != 2:
         return False
-    return tensor.size(0) % 16 == 0 and tensor.size(1) % 16 == 0
+    return tensor.size(0) % alignment == 0 and tensor.size(1) % alignment == 0
 
 
 def detect_input_format(sd, metadata):
@@ -163,7 +169,7 @@ def dequantize_input(sd, metadata, log=_noop_logger):
 
     for layer, info in quant_layers.items():
         fmt = info.get("format")
-        if fmt in ("nvfp4", "mxfp8", "convrot_w4a4"):
+        if fmt in ("nvfp4", "mxfp8", "convrot_w4a4", "asym_w4a8_int8"):
             raise ValueError(f"Input model contains {fmt} layers ('{layer}'), which cannot be dequantized losslessly. Use a higher precision source model.")
         if info.get("convrot") and fmt != "convrot_w4a4":
             raise ValueError(f"Input model contains ConvRot-rotated INT8 layers ('{layer}'). Use a higher precision source model.")
@@ -217,6 +223,8 @@ def _require_quantization_deps(target_format):
         raise RuntimeError("comfy-kitchen is not installed. Install extension requirements before using quantized target formats.")
     if target_format == "int4_convrot" and TensorCoreConvRotW4A4Layout is None:
         raise RuntimeError("This comfy-kitchen version does not support int4_convrot. Update Forge Neo/comfy-kitchen first.")
+    if target_format == "w4a8_convrot" and AsymW4A8Int8Layout is None:
+        raise RuntimeError("This comfy-kitchen version does not support w4a8_convrot. Update Forge Neo/comfy-kitchen first.")
 
 
 def convert_model(model_path, model_type, target_format, device, log=_noop_logger, source_kind="model"):
@@ -264,6 +272,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     counts = Counter()
     total = len(sd)
     mxfp8_backend = pick_mxfp8_backend(device, log=log) if target_format == "mxfp8" else None
+    quant_alignment = CONVROT_GROUPSIZE if target_format == "w4a8_convrot" else 16
 
     if target_format in ("fp16", "fp32"):
         target_dtype = torch.float16 if target_format == "fp16" else torch.float32
@@ -286,7 +295,12 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 counts[count_name] += 1
                 continue
 
-            if can_quantize_weight(k, v, protected_substrings=protected_substrings):
+            if can_quantize_weight(
+                k,
+                v,
+                protected_substrings=protected_substrings,
+                alignment=quant_alignment,
+            ):
                 base_k_file = k.replace(".weight", "")
                 base_k_meta = base_k_file
 
@@ -310,12 +324,16 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
 
                 int8_convrot = target_format == "int8_convrot"
                 int4_convrot = target_format == "int4_convrot"
+                w4a8_convrot = target_format == "w4a8_convrot"
                 if target_format in ("int8", "int8_convrot"):
                     layout = TensorWiseINT8Layout
                     fmt_name = "int8_tensorwise"
                 elif int4_convrot:
                     layout = TensorCoreConvRotW4A4Layout
                     fmt_name = "convrot_w4a4"
+                elif w4a8_convrot:
+                    layout = AsymW4A8Int8Layout
+                    fmt_name = "asym_w4a8_int8"
                 elif target_format == "mxfp8":
                     layout = TensorCoreMXFP8Layout
                     fmt_name = "mxfp8"
@@ -337,6 +355,13 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                             v_tensor_ready,
                             convrot_groupsize=CONVROT_GROUPSIZE,
                             quant_group_size=INT4_QUANT_GROUPSIZE,
+                        )
+                    elif w4a8_convrot:
+                        qdata, params = layout.quantize(
+                            v_tensor_ready,
+                            group_size=W4A8_QUANT_GROUPSIZE,
+                            convrot_groupsize=CONVROT_GROUPSIZE,
+                            scale_dtype=torch.float8_e4m3fn,
                         )
                     elif mxfp8_backend is not None:
                         with ck_registry.use_backend(mxfp8_backend):
@@ -361,6 +386,9 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     elif int4_convrot:
                         layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
                         layer_conf["quant_group_size"] = INT4_QUANT_GROUPSIZE
+                    elif w4a8_convrot:
+                        layer_conf["group_size"] = W4A8_QUANT_GROUPSIZE
+                        layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
                     new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
                     quant_map["layers"][base_k_meta] = layer_conf
                     counts[target_format] += 1

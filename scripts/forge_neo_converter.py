@@ -22,7 +22,7 @@ import forge_neo_converter_core as converter_core  # noqa: E402
 if not all(
     hasattr(converter_core, name)
     for name in ("TEXT_ENCODER_PROFILE", "convert_text_encoder")
-):
+) or "w4a8_convrot" not in converter_core.TARGET_FORMATS:
     converter_core = importlib.reload(converter_core)
 
 TARGET_FORMATS = converter_core.TARGET_FORMATS
