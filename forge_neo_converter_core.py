@@ -1,5 +1,6 @@
 import json
 import os
+import gc
 import re
 import time
 from collections import Counter, OrderedDict
@@ -153,6 +154,32 @@ def load_input(path, log=_noop_logger):
     return sd, orig_meta
 
 
+def inspect_lazy_input(path, log=_noop_logger):
+    """Inspect a safetensors file without retaining the whole state dict in RAM."""
+    log(f"Inspecting lazily: {path}")
+    counts = Counter()
+    with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        metadata = f.metadata()
+        for k in keys:
+            t = f.get_tensor(k)
+            counts[DTYPE_NAMES.get(t.dtype, str(t.dtype))] += 1
+            del t
+    gc.collect()
+    parts = [f"{name} ({n} tensors)" for name, n in counts.most_common()]
+    fmt = ", ".join(parts)
+    if metadata and "_quantization_metadata" in metadata:
+        fmt += " [quantization metadata]"
+    return keys, metadata, fmt
+
+
+def can_stream_input(metadata, keys):
+    """Return True for normal high-precision inputs that need no cross-tensor dequantization."""
+    if metadata and "_quantization_metadata" in metadata:
+        return False
+    return "scaled_fp8" not in keys
+
+
 def dequantize_input(sd, metadata, log=_noop_logger):
     quant_layers = {}
     if metadata and "_quantization_metadata" in metadata:
@@ -255,7 +282,21 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     log(f"Converting on: {device}")
 
     input_bytes = os.path.getsize(model_path)
-    sd, orig_meta = load_input(model_path, log=log)
+    lazy_keys, orig_meta, lazy_format = inspect_lazy_input(model_path, log=log)
+    streaming_input = can_stream_input(orig_meta, lazy_keys)
+
+    if streaming_input:
+        log("Memory mode: streaming input tensors (avoids loading the full source model into RAM)")
+        sd = None
+        input_format = lazy_format
+        total = len(lazy_keys)
+    else:
+        log("Memory mode: legacy full input load (input requires dequantization or special handling)")
+        sd, orig_meta = load_input(model_path, log=log)
+        input_format = detect_input_format(sd, orig_meta)
+        sd = dequantize_input(sd, orig_meta, log=log)
+        total = len(sd)
+        lazy_keys = list(sd.keys())
 
     temp_diffusers_meta = OrderedDict()
     if orig_meta:
@@ -263,20 +304,25 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
             if key != "_quantization_metadata":
                 temp_diffusers_meta[key] = value
 
-    input_format = detect_input_format(sd, orig_meta)
     log(f"Original format: {input_format}")
-    sd = dequantize_input(sd, orig_meta, log=log)
 
     quant_map = {"format_version": "1.0", "layers": {}}
     new_sd = {}
     counts = Counter()
-    total = len(sd)
     mxfp8_backend = pick_mxfp8_backend(device, log=log) if target_format == "mxfp8" else None
     quant_alignment = CONVROT_GROUPSIZE if target_format == "w4a8_convrot" else 16
 
+    def iter_input_tensors():
+        if streaming_input:
+            with safetensors.safe_open(model_path, framework="pt", device="cpu") as handle:
+                for key in lazy_keys:
+                    yield key, handle.get_tensor(key)
+        else:
+            yield from sd.items()
+
     if target_format in ("fp16", "fp32"):
         target_dtype = torch.float16 if target_format == "fp16" else torch.float32
-        for i, (k, v) in enumerate(sd.items(), start=1):
+        for i, (k, v) in enumerate(iter_input_tensors(), start=1):
             if i == 1 or i == total or i % 100 == 0:
                 log(f"Progress: {i}/{total}")
             if v.dtype.is_floating_point:
@@ -285,14 +331,17 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
             else:
                 new_sd[k] = v
                 counts["kept"] += 1
+            if i % 16 == 0:
+                gc.collect()
     else:
-        for i, (k, v) in enumerate(sd.items(), start=1):
+        for i, (k, v) in enumerate(iter_input_tensors(), start=1):
             if i == 1 or i == total or i % 100 == 0:
                 log(f"Progress: {i}/{total}")
 
             if any(name in k for name in blacklist):
                 new_sd[k], count_name = preserve_tensor(v, source_kind)
                 counts[count_name] += 1
+                del v
                 continue
 
             if can_quantize_weight(
@@ -318,8 +367,9 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
                     quant_map["layers"][base_k_meta] = layer_conf
                     counts["fp8"] += 1
+                    del v_tensor, v
                     if device == "cuda":
-                        del v_tensor
+                        torch.cuda.empty_cache()
                     continue
 
                 int8_convrot = target_format == "int8_convrot"
@@ -401,18 +451,22 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 # quantization layouts can allocate several working buffers, so
                 # retaining one iteration is enough to OOM a 16 GB GPU.
                 del qdata, params, tensors, v_tensor_ready, v_tensor
+                del v
                 if device == "cuda":
                     torch.cuda.empty_cache()
             else:
                 new_sd[k], count_name = preserve_tensor(v, source_kind)
                 counts[count_name] += 1
+                del v
+            if i % 16 == 0:
+                gc.collect()
 
     final_metadata = OrderedDict(temp_diffusers_meta)
     if quant_map["layers"]:
         final_metadata["_quantization_metadata"] = json.dumps(quant_map)
         first_quant_layer = next(iter(quant_map["layers"]))
         log(f"Quantization metadata: {len(quant_map['layers'])} layers, first key: {first_quant_layer}")
-    final_metadata["converted_by"] = "Star Ultimate Model Converter"
+    final_metadata["converted_by"] = "Star Ultimate Model Converter (streaming input patch)"
 
     log(f"Saving | Type: {active_model_type} | Path: {output_path}")
     safetensors.torch.save_file(new_sd, output_path, metadata=final_metadata)
