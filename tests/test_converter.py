@@ -61,6 +61,28 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(core.can_quantize_weight(key, tensor))
         self.assertTrue(core.can_quantize_weight(key, tensor, protected_substrings=()))
 
+    def test_high_precision_streaming_does_not_load_full_state_dict(self):
+        state_dict = {
+            "layer.weight": torch.ones((16, 16), dtype=torch.float16),
+            "layer.bias": torch.ones(16, dtype=torch.float16),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-bf16.safetensors")
+            safetensors.torch.save_file(state_dict, source)
+
+            with mock.patch.object(
+                core.safetensors.torch,
+                "load_file",
+                side_effect=AssertionError("full state dict load is not allowed"),
+            ):
+                _, output = core.convert_model(
+                    source, "Other/Unknown", "fp16", "cpu"
+                )
+
+            converted = safetensors.torch.load_file(output)
+            self.assertEqual(set(converted), set(state_dict))
+
     def test_text_encoder_quantization_uses_profile_and_preserves_embeddings_in_bf16(self):
         state_dict = {
             "text_model.encoder.layers.0.mlp.fc1.weight": torch.ones((16, 16), dtype=torch.float32),
@@ -137,6 +159,132 @@ class CoreTests(unittest.TestCase):
                     "convrot_groupsize": 256,
                 },
             )
+
+    @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "PyTorch has no FP8 dtype")
+    def test_streaming_fp8_input_applies_weight_scale_before_fp16_conversion(self):
+        state_dict = {
+            "layer.weight": torch.ones((16, 16), dtype=torch.float16).to(
+                torch.float8_e4m3fn
+            ),
+            "layer.weight_scale": torch.tensor(2.0, dtype=torch.float32),
+            "layer.comfy_quant": core.encode_quant_config(
+                {"format": "float8_e4m3fn"}
+            ),
+        }
+        quantization = {
+            "format_version": "1.0",
+            "layers": {"layer": {"format": "float8_e4m3fn"}},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-fp8.safetensors")
+            safetensors.torch.save_file(
+                state_dict,
+                source,
+                metadata={
+                    "_quantization_metadata": json.dumps(quantization),
+                    "fixture": "streaming-fp8",
+                },
+            )
+
+            _, output = core.convert_model(
+                source, "Other/Unknown", "fp16", "cpu"
+            )
+
+            converted = safetensors.torch.load_file(output)
+            self.assertEqual(set(converted), {"layer.weight"})
+            self.assertEqual(converted["layer.weight"].dtype, torch.float16)
+            self.assertTrue(
+                torch.equal(
+                    converted["layer.weight"],
+                    torch.full((16, 16), 2.0, dtype=torch.float16),
+                )
+            )
+            with safetensors.safe_open(output, framework="pt") as handle:
+                metadata = handle.metadata()
+            self.assertEqual(metadata["fixture"], "streaming-fp8")
+            self.assertNotIn("_quantization_metadata", metadata)
+
+    def test_streaming_int8_input_applies_weight_scale_before_fp16_conversion(self):
+        state_dict = {
+            "layer.weight": torch.ones((16, 16), dtype=torch.int8),
+            "layer.weight_scale": torch.tensor(3.0, dtype=torch.float32),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-int8.safetensors")
+            safetensors.torch.save_file(state_dict, source)
+
+            _, output = core.convert_model(
+                source, "Other/Unknown", "fp16", "cpu"
+            )
+
+            converted = safetensors.torch.load_file(output)
+            self.assertEqual(set(converted), {"layer.weight"})
+            self.assertEqual(converted["layer.weight"].dtype, torch.float16)
+            self.assertTrue(
+                torch.equal(
+                    converted["layer.weight"],
+                    torch.full((16, 16), 3.0, dtype=torch.float16),
+                )
+            )
+
+    def test_streaming_int8_input_without_scale_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-int8.safetensors")
+            safetensors.torch.save_file(
+                {"layer.weight": torch.ones((16, 16), dtype=torch.int8)},
+                source,
+            )
+
+            with self.assertRaisesRegex(ValueError, "has no 'layer.weight_scale'"):
+                core.convert_model(source, "Other/Unknown", "fp16", "cpu")
+
+            self.assertFalse(os.path.exists(os.path.join(temp_dir, "model-fp16.safetensors")))
+
+    @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "PyTorch has no FP8 dtype")
+    def test_streaming_scaled_fp8_removes_auxiliary_tensors(self):
+        state_dict = {
+            "scaled_fp8": torch.tensor(1, dtype=torch.uint8),
+            "layer.weight": torch.ones((16, 16), dtype=torch.float16).to(
+                torch.float8_e4m3fn
+            ),
+            "layer.scale_weight": torch.tensor(4.0, dtype=torch.float32),
+            "layer.scale_input": torch.tensor(5.0, dtype=torch.float32),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-fp8-scaled.safetensors")
+            safetensors.torch.save_file(state_dict, source)
+
+            status, output = core.convert_model(
+                source, "Other/Unknown", "fp16", "cpu"
+            )
+
+            converted = safetensors.torch.load_file(output)
+            self.assertEqual(set(converted), {"layer.weight"})
+            self.assertTrue(
+                torch.equal(
+                    converted["layer.weight"],
+                    torch.full((16, 16), 4.0, dtype=torch.float16),
+                )
+            )
+            self.assertIn("[ComfyUI scaled fp8]", status)
+
+    def test_streaming_rejects_lossy_embedded_quantization_before_writing(self):
+        state_dict = {
+            "layer.weight": torch.ones((16, 16), dtype=torch.float16),
+            "layer.comfy_quant": core.encode_quant_config({"format": "nvfp4"}),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-nvfp4.safetensors")
+            safetensors.torch.save_file(state_dict, source)
+
+            with self.assertRaisesRegex(ValueError, "cannot be dequantized losslessly"):
+                core.convert_model(source, "Other/Unknown", "fp16", "cpu")
+
+            self.assertFalse(os.path.exists(os.path.join(temp_dir, "model-fp16.safetensors")))
 
 
 class UiTests(unittest.TestCase):

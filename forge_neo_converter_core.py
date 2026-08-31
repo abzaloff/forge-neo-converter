@@ -3,6 +3,7 @@ import os
 import re
 import time
 from collections import Counter, OrderedDict
+from dataclasses import dataclass
 
 import safetensors
 import safetensors.torch
@@ -72,6 +73,16 @@ if hasattr(torch, "float8_e4m3fn"):
     DTYPE_NAMES[torch.float8_e4m3fn] = "fp8_e4m3fn"
 if hasattr(torch, "float8_e5m2"):
     DTYPE_NAMES[torch.float8_e5m2] = "fp8_e5m2"
+
+
+@dataclass
+class StreamingInputPlan:
+    keys: list
+    metadata: dict
+    input_format: str
+    dtypes: dict
+    scale_by_weight: dict
+    skipped_keys: set
 
 
 def _noop_logger(_message):
@@ -153,6 +164,109 @@ def load_input(path, log=_noop_logger):
     return sd, orig_meta
 
 
+def _parse_embedded_quant_config(tensor):
+    return json.loads(bytes(tensor.cpu().to(torch.uint8).tolist()))
+
+
+def _validate_quant_layers(quant_layers):
+    for layer, info in quant_layers.items():
+        fmt = info.get("format")
+        if fmt in ("nvfp4", "mxfp8", "convrot_w4a4", "asym_w4a8_int8"):
+            raise ValueError(
+                f"Input model contains {fmt} layers ('{layer}'), which cannot be "
+                "dequantized losslessly. Use a higher precision source model."
+            )
+        if info.get("convrot") and fmt != "convrot_w4a4":
+            raise ValueError(
+                f"Input model contains ConvRot-rotated INT8 layers ('{layer}'). "
+                "Use a higher precision source model."
+            )
+
+
+def inspect_streaming_input(path, log=_noop_logger):
+    """Build a lightweight plan for reading and dequantizing one tensor at a time."""
+    log(f"Inspecting input: {path}")
+    counts = Counter()
+    dtypes = {}
+    embedded_quant_layers = {}
+
+    with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+        keys = list(handle.keys())
+        metadata = handle.metadata()
+        for key in keys:
+            tensor = handle.get_tensor(key)
+            dtypes[key] = tensor.dtype
+            counts[DTYPE_NAMES.get(tensor.dtype, str(tensor.dtype))] += 1
+            if key.endswith(".comfy_quant"):
+                layer = key[: -len(".comfy_quant")]
+                try:
+                    embedded_quant_layers[layer] = _parse_embedded_quant_config(tensor)
+                except Exception:
+                    log(f"Warning: could not parse embedded quant config for '{layer}', ignoring.")
+
+    quant_layers = {}
+    if metadata and "_quantization_metadata" in metadata:
+        quant_layers = json.loads(metadata["_quantization_metadata"]).get("layers", {})
+    for layer, info in embedded_quant_layers.items():
+        quant_layers.setdefault(layer, info)
+    _validate_quant_layers(quant_layers)
+
+    skipped_keys = {key for key in keys if key.endswith(".comfy_quant")}
+    scale_by_weight = {}
+
+    if "scaled_fp8" in dtypes:
+        skipped_keys.add("scaled_fp8")
+        skipped_keys.update(key for key in keys if key.endswith(".scale_input"))
+        for scale_key in (key for key in keys if key.endswith(".scale_weight")):
+            weight_key = scale_key[: -len(".scale_weight")] + ".weight"
+            if weight_key in dtypes:
+                scale_by_weight[weight_key] = scale_key
+                skipped_keys.add(scale_key)
+
+    for key, dtype in dtypes.items():
+        if not key.endswith(".weight") or key in scale_by_weight:
+            continue
+        if dtype in FP8_DTYPES or dtype == torch.int8:
+            scale_key = key + "_scale"
+            if scale_key in dtypes:
+                scale_by_weight[key] = scale_key
+                skipped_keys.add(scale_key)
+            elif dtype == torch.int8:
+                raise ValueError(
+                    f"int8 weight '{key}' has no '{scale_key}' tensor, cannot dequantize."
+                )
+
+    parts = [f"{name} ({n} tensors)" for name, n in counts.most_common()]
+    input_format = ", ".join(parts)
+    if "scaled_fp8" in dtypes:
+        input_format += " [ComfyUI scaled fp8]"
+    elif metadata and "_quantization_metadata" in metadata:
+        input_format += " [quantization metadata]"
+
+    return StreamingInputPlan(
+        keys=[key for key in keys if key not in skipped_keys],
+        metadata=metadata,
+        input_format=input_format,
+        dtypes=dtypes,
+        scale_by_weight=scale_by_weight,
+        skipped_keys=skipped_keys,
+    )
+
+
+def iter_streaming_input(path, plan):
+    """Yield input tensors while applying lossless per-tensor dequantization."""
+    with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+        for key in plan.keys:
+            tensor = handle.get_tensor(key)
+            scale_key = plan.scale_by_weight.get(key)
+            if scale_key is not None:
+                scale = handle.get_tensor(scale_key)
+                tensor = (tensor.to(torch.float32) * scale.to(torch.float32)).to(
+                    torch.bfloat16
+                )
+            yield key, tensor
+
+
 def dequantize_input(sd, metadata, log=_noop_logger):
     quant_layers = {}
     if metadata and "_quantization_metadata" in metadata:
@@ -167,12 +281,7 @@ def dequantize_input(sd, metadata, log=_noop_logger):
             except Exception:
                 log(f"Warning: could not parse embedded quant config for '{layer}', ignoring.")
 
-    for layer, info in quant_layers.items():
-        fmt = info.get("format")
-        if fmt in ("nvfp4", "mxfp8", "convrot_w4a4", "asym_w4a8_int8"):
-            raise ValueError(f"Input model contains {fmt} layers ('{layer}'), which cannot be dequantized losslessly. Use a higher precision source model.")
-        if info.get("convrot") and fmt != "convrot_w4a4":
-            raise ValueError(f"Input model contains ConvRot-rotated INT8 layers ('{layer}'). Use a higher precision source model.")
+    _validate_quant_layers(quant_layers)
 
     if "scaled_fp8" in sd:
         sd.pop("scaled_fp8")
@@ -255,7 +364,8 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     log(f"Converting on: {device}")
 
     input_bytes = os.path.getsize(model_path)
-    sd, orig_meta = load_input(model_path, log=log)
+    input_plan = inspect_streaming_input(model_path, log=log)
+    orig_meta = input_plan.metadata
 
     temp_diffusers_meta = OrderedDict()
     if orig_meta:
@@ -263,20 +373,20 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
             if key != "_quantization_metadata":
                 temp_diffusers_meta[key] = value
 
-    input_format = detect_input_format(sd, orig_meta)
+    input_format = input_plan.input_format
     log(f"Original format: {input_format}")
-    sd = dequantize_input(sd, orig_meta, log=log)
+    log("Memory mode: streaming source tensors with per-layer dequantization")
 
     quant_map = {"format_version": "1.0", "layers": {}}
     new_sd = {}
     counts = Counter()
-    total = len(sd)
+    total = len(input_plan.keys)
     mxfp8_backend = pick_mxfp8_backend(device, log=log) if target_format == "mxfp8" else None
     quant_alignment = CONVROT_GROUPSIZE if target_format == "w4a8_convrot" else 16
 
     if target_format in ("fp16", "fp32"):
         target_dtype = torch.float16 if target_format == "fp16" else torch.float32
-        for i, (k, v) in enumerate(sd.items(), start=1):
+        for i, (k, v) in enumerate(iter_streaming_input(model_path, input_plan), start=1):
             if i == 1 or i == total or i % 100 == 0:
                 log(f"Progress: {i}/{total}")
             if v.dtype.is_floating_point:
@@ -286,7 +396,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 new_sd[k] = v
                 counts["kept"] += 1
     else:
-        for i, (k, v) in enumerate(sd.items(), start=1):
+        for i, (k, v) in enumerate(iter_streaming_input(model_path, input_plan), start=1):
             if i == 1 or i == total or i % 100 == 0:
                 log(f"Progress: {i}/{total}")
 
