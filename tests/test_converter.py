@@ -286,6 +286,83 @@ class CoreTests(unittest.TestCase):
 
             self.assertFalse(os.path.exists(os.path.join(temp_dir, "model-fp16.safetensors")))
 
+    def test_atomic_save_replaces_existing_output_after_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-bf16.safetensors")
+            output = os.path.join(temp_dir, "model-fp16.safetensors")
+            safetensors.torch.save_file(
+                {"layer.weight": torch.full((16, 16), 2.0, dtype=torch.bfloat16)},
+                source,
+            )
+            safetensors.torch.save_file(
+                {"stale": torch.tensor(1, dtype=torch.int64)},
+                output,
+                metadata={"state": "old"},
+            )
+
+            _, converted_path = core.convert_model(
+                source, "Other/Unknown", "fp16", "cpu"
+            )
+
+            self.assertEqual(converted_path, output)
+            converted = safetensors.torch.load_file(output)
+            self.assertEqual(set(converted), {"layer.weight"})
+            self.assertFalse(any(name.endswith(".partial") for name in os.listdir(temp_dir)))
+
+    def test_atomic_save_validation_failure_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-bf16.safetensors")
+            output = os.path.join(temp_dir, "model-fp16.safetensors")
+            safetensors.torch.save_file(
+                {"layer.weight": torch.ones((16, 16), dtype=torch.bfloat16)},
+                source,
+            )
+            safetensors.torch.save_file(
+                {"sentinel": torch.tensor(7, dtype=torch.int64)},
+                output,
+                metadata={"state": "old"},
+            )
+
+            with mock.patch.object(
+                core,
+                "_validate_saved_safetensors",
+                side_effect=RuntimeError("validation failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                    core.convert_model(source, "Other/Unknown", "fp16", "cpu")
+
+            preserved = safetensors.torch.load_file(output)
+            self.assertEqual(set(preserved), {"sentinel"})
+            self.assertEqual(preserved["sentinel"].item(), 7)
+            self.assertFalse(any(name.endswith(".partial") for name in os.listdir(temp_dir)))
+
+    def test_atomic_save_write_failure_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-bf16.safetensors")
+            output = os.path.join(temp_dir, "model-fp16.safetensors")
+            safetensors.torch.save_file(
+                {"layer.weight": torch.ones((16, 16), dtype=torch.bfloat16)},
+                source,
+            )
+            safetensors.torch.save_file(
+                {"sentinel": torch.tensor(9, dtype=torch.int64)},
+                output,
+                metadata={"state": "old"},
+            )
+
+            with mock.patch.object(
+                core.safetensors.torch,
+                "save_file",
+                side_effect=OSError("disk full"),
+            ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    core.convert_model(source, "Other/Unknown", "fp16", "cpu")
+
+            preserved = safetensors.torch.load_file(output)
+            self.assertEqual(set(preserved), {"sentinel"})
+            self.assertEqual(preserved["sentinel"].item(), 9)
+            self.assertFalse(any(name.endswith(".partial") for name in os.listdir(temp_dir)))
+
 
 class UiTests(unittest.TestCase):
     @classmethod

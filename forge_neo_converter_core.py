@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import tempfile
 import time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
@@ -267,6 +268,65 @@ def iter_streaming_input(path, plan):
             yield key, tensor
 
 
+def _validate_saved_safetensors(path, tensors, metadata):
+    if os.path.getsize(path) <= 0:
+        raise RuntimeError("Saved safetensors file is empty.")
+
+    expected_keys = set(tensors)
+    with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+        saved_keys = set(handle.keys())
+        if saved_keys != expected_keys:
+            missing = sorted(expected_keys - saved_keys)
+            extra = sorted(saved_keys - expected_keys)
+            raise RuntimeError(
+                f"Saved safetensors keys do not match output. Missing: {missing}; "
+                f"extra: {extra}."
+            )
+
+        for key, expected in tensors.items():
+            saved = handle.get_tensor(key)
+            if saved.dtype != expected.dtype or tuple(saved.shape) != tuple(expected.shape):
+                raise RuntimeError(
+                    f"Saved tensor '{key}' does not match output: expected "
+                    f"{expected.dtype} {tuple(expected.shape)}, got "
+                    f"{saved.dtype} {tuple(saved.shape)}."
+                )
+
+        saved_metadata = handle.metadata() or {}
+
+    expected_metadata = dict(metadata or {})
+    if saved_metadata != expected_metadata:
+        raise RuntimeError("Saved safetensors metadata does not match output metadata.")
+
+
+def save_safetensors_atomic(tensors, output_path, metadata, log=_noop_logger):
+    """Validate a same-directory temporary file before atomically replacing output."""
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    output_name = os.path.basename(output_path)
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_dir,
+            prefix=f".{output_name}.",
+            suffix=".partial",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+
+        log(f"Writing temporary output: {temp_path}")
+        safetensors.torch.save_file(tensors, temp_path, metadata=metadata)
+        _validate_saved_safetensors(temp_path, tensors, metadata)
+        os.replace(temp_path, output_path)
+        temp_path = None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError as error:
+                log(f"Warning: could not remove temporary output '{temp_path}': {error}")
+
+
 def dequantize_input(sd, metadata, log=_noop_logger):
     quant_layers = {}
     if metadata and "_quantization_metadata" in metadata:
@@ -524,8 +584,8 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
         log(f"Quantization metadata: {len(quant_map['layers'])} layers, first key: {first_quant_layer}")
     final_metadata["converted_by"] = "Star Ultimate Model Converter"
 
-    log(f"Saving | Type: {active_model_type} | Path: {output_path}")
-    safetensors.torch.save_file(new_sd, output_path, metadata=final_metadata)
+    log(f"Saving safely | Type: {active_model_type} | Path: {output_path}")
+    save_safetensors_atomic(new_sd, output_path, final_metadata, log=log)
 
     output_bytes = os.path.getsize(output_path)
     duration = time.time() - start_time
