@@ -549,12 +549,21 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     log(f"FP8: {k}")
                     weight_scale = (v_tensor.abs().max() / 448.0).clamp(min=1e-12).float()
                     weight_quantized = ck.quantize_per_tensor_fp8(v_tensor, weight_scale)
-                    new_sd[k] = weight_quantized.cpu()
-                    new_sd[f"{base_k_file}.weight_scale"] = weight_scale.to(torch.bfloat16).cpu()
+                    stored_weight = weight_quantized.cpu()
+                    stored_scale = weight_scale.to(torch.bfloat16).cpu()
                     layer_conf = {"format": "float8_e4m3fn"}
-                    new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
+                    comfy_tensor = encode_quant_config(layer_conf)
+                    new_sd[k] = stored_weight
+                    new_sd[f"{base_k_file}.weight_scale"] = stored_scale
+                    new_sd[f"{base_k_file}.comfy_quant"] = comfy_tensor
                     quant_map["layers"][base_k_meta] = layer_conf
                     counts["fp8"] += 1
+                    coverage_bytes["fp8"] += source_tensor_bytes
+                    coverage_bytes["fp8 stored"] += (
+                        tensor_nbytes(stored_weight)
+                        + tensor_nbytes(stored_scale)
+                        + tensor_nbytes(comfy_tensor)
+                    )
                     if device == "cuda":
                         del v_tensor
                     continue
@@ -737,10 +746,12 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     reduction = (1 - output_bytes / input_bytes) * 100 if input_bytes else 0
     layers_desc = ", ".join(f"{n} {name}" for name, n in counts.most_common())
     if target_format not in ("fp16", "fp32"):
+        quantized_coverage_names = tuple(
+            dict.fromkeys((target_format, "fp8", "int8_convrot fallback"))
+        )
         coverage_parts = []
         for name in (
-            target_format,
-            "int8_convrot fallback",
+            *quantized_coverage_names,
             "convrot shape kept",
             "quantization failed kept",
             "kept by profile",
@@ -753,7 +764,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
         if coverage_parts:
             log("Quantization coverage | " + " | ".join(coverage_parts))
         storage_parts = []
-        for name in (target_format, "int8_convrot fallback"):
+        for name in quantized_coverage_names:
             source_num = coverage_bytes.get(name, 0)
             stored_num = coverage_bytes.get(f"{name} stored", 0)
             if source_num and stored_num:
@@ -775,7 +786,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
 
         quantized_source_bytes = sum(
             coverage_bytes.get(name, 0)
-            for name in (target_format, "int8_convrot fallback")
+            for name in quantized_coverage_names
         )
         if matrix_source_bytes:
             matrix_coverage = 100.0 * quantized_source_bytes / matrix_source_bytes
