@@ -80,7 +80,12 @@
       "_note": "Groups SeedVR and SeedVR2. Protects positional/patch embeddings and modulations to prevent structural artifacts.",
       "blacklist": ["bias", "norm", "scale", "final_layer", "proj_out", "pos_emb", "neg_emb", "patch_embed", "pos_embed", "x_embedder", "t_embedder", "context_embedder", "y_embedder", "time_in", "vector_in", "guidance_in", "txt_in", "img_in", "single_stream_modulation", "double_stream_modulation", "vae", "attn.proj_qkv_vid"],
       "fp8_layers": [],
-      "preserve_extended_metadata": false
+      "preserve_extended_metadata": false,
+      "target_overrides": {
+        "int8_convrot": {"blacklist_remove": ["proj_out"]},
+        "int4_convrot": {"blacklist_remove": ["proj_out"]},
+        "w4a8_convrot": {"blacklist_remove": ["proj_out"]}
+      }
     },
     "Text-Encoder": {
       "_note": "Generic profile for text encoders such as CLIP, T5, and Llama.",

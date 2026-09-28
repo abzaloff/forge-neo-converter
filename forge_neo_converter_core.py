@@ -40,6 +40,7 @@ EXTENDED_METADATA_KEYS = ["config", "license", "encrypted_wandb_properties"]
 TARGET_FORMATS = ["nvfp4", "fp8", "mxfp8", "int8", "int8_convrot", "int4_convrot", "w4a8_convrot", "fp16", "fp32"]
 TEXT_ENCODER_PROFILE = "Text-Encoder"
 CONVROT_GROUPSIZE = 256
+CONVROT_GROUPSIZES = (256, 64, 16)
 INT4_QUANT_GROUPSIZE = 64
 W4A8_QUANT_GROUPSIZE = 16
 FORGE_SENSITIVE_SUBSTRINGS = (
@@ -99,13 +100,24 @@ def model_types():
     return list(load_model_configs()["models"].keys())
 
 
-def get_profile(configs, model_type):
+def get_profile(configs, model_type, target_format=None):
     default = configs["default"]
     profile = configs["models"].get(model_type, default)
+    blacklist = list(profile.get("blacklist", default["blacklist"]))
+    override = {}
+    if target_format:
+        override = profile.get("target_overrides", {}).get(target_format, {})
+        remove = set(override.get("blacklist_remove", []))
+        if remove:
+            blacklist = [name for name in blacklist if name not in remove]
+        for name in override.get("blacklist_add", []):
+            if name not in blacklist:
+                blacklist.append(name)
     return (
-        profile.get("blacklist", default["blacklist"]),
+        blacklist,
         profile.get("fp8_layers", default["fp8_layers"]),
         profile.get("preserve_extended_metadata", default["preserve_extended_metadata"]),
+        override,
     )
 
 
@@ -134,16 +146,29 @@ def preserve_tensor(tensor, source_kind):
     return keep_tensor_dtype(tensor), "kept"
 
 
-def can_quantize_weight(key, tensor, protected_substrings=FORGE_SENSITIVE_SUBSTRINGS, alignment=16):
+def is_quantizable_weight(key, tensor, protected_substrings=FORGE_SENSITIVE_SUBSTRINGS):
     if not key.endswith(".weight"):
         return False
     if any(name in key for name in protected_substrings):
         return False
     if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
-    if tensor.ndim != 2:
+    return tensor.ndim == 2
+
+
+def can_quantize_weight(key, tensor, protected_substrings=FORGE_SENSITIVE_SUBSTRINGS, alignment=16):
+    if not is_quantizable_weight(key, tensor, protected_substrings=protected_substrings):
         return False
     return tensor.size(0) % alignment == 0 and tensor.size(1) % alignment == 0
+
+
+def best_convrot_groupsize(in_features):
+    """Pick the largest supported Hadamard group that divides K (in_features)."""
+    return next((group for group in CONVROT_GROUPSIZES if in_features % group == 0), None)
+
+
+def tensor_nbytes(tensor):
+    return tensor.numel() * tensor.element_size()
 
 
 def detect_input_format(sd, metadata):
@@ -412,7 +437,9 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
 
     configs = load_model_configs()
     active_model_type = TEXT_ENCODER_PROFILE if source_kind == "text_encoder" else model_type
-    blacklist, fp8_layers, preserve_extended = get_profile(configs, active_model_type)
+    blacklist, fp8_layers, preserve_extended, target_override = get_profile(
+        configs, active_model_type, target_format=target_format
+    )
     protected_substrings = () if source_kind == "text_encoder" else FORGE_SENSITIVE_SUBSTRINGS
     source_label = "Text encoder" if source_kind == "text_encoder" else "Model"
     start_time = time.time()
@@ -421,6 +448,16 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     output_path = build_output_path(out_dir, base_name, target_format)
 
     log(f"{source_label} conversion profile: {active_model_type} | target: {target_format}")
+    if target_override:
+        removed = target_override.get("blacklist_remove", [])
+        added = target_override.get("blacklist_add", [])
+        details = []
+        if removed:
+            details.append("allow=" + ",".join(removed))
+        if added:
+            details.append("protect=" + ",".join(added))
+        if details:
+            log("Target-specific profile override: " + " | ".join(details))
     log(f"Converting on: {device}")
 
     input_bytes = os.path.getsize(model_path)
@@ -440,9 +477,15 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     quant_map = {"format_version": "1.0", "layers": {}}
     new_sd = {}
     counts = Counter()
+    reason_counts = Counter()
+    coverage_bytes = Counter()
+    profile_keep_bytes = Counter()
+    global_keep_bytes = Counter()
+    matrix_source_bytes = 0
     total = len(input_plan.keys)
     mxfp8_backend = pick_mxfp8_backend(device, log=log) if target_format == "mxfp8" else None
-    quant_alignment = CONVROT_GROUPSIZE if target_format == "w4a8_convrot" else 16
+    convrot_target = target_format in ("int8_convrot", "int4_convrot", "w4a8_convrot")
+    quant_alignment = 16
 
     if target_format in ("fp16", "fp32"):
         target_dtype = torch.float16 if target_format == "fp16" else torch.float32
@@ -460,17 +503,41 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
             if i == 1 or i == total or i % 100 == 0:
                 log(f"Progress: {i}/{total}")
 
-            if any(name in k for name in blacklist):
+            source_tensor_bytes = tensor_nbytes(v)
+            if (
+                k.endswith(".weight")
+                and v.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and v.ndim == 2
+            ):
+                matrix_source_bytes += source_tensor_bytes
+
+            matched_profile_rule = next((name for name in blacklist if name in k), None)
+            if matched_profile_rule is not None:
                 new_sd[k], count_name = preserve_tensor(v, source_kind)
                 counts[count_name] += 1
+                coverage_bytes["kept by profile"] += source_tensor_bytes
+                profile_keep_bytes[matched_profile_rule] += source_tensor_bytes
                 continue
 
-            if can_quantize_weight(
-                k,
-                v,
-                protected_substrings=protected_substrings,
-                alignment=quant_alignment,
-            ):
+            matched_global_rule = next((name for name in protected_substrings if name in k), None)
+            if matched_global_rule is not None:
+                new_sd[k], count_name = preserve_tensor(v, source_kind)
+                counts[count_name] += 1
+                coverage_bytes["kept by global protection"] += source_tensor_bytes
+                global_keep_bytes[matched_global_rule] += source_tensor_bytes
+                continue
+
+            basic_candidate = is_quantizable_weight(k, v, protected_substrings=())
+            if target_format in ("fp8", "int8"):
+                candidate = basic_candidate
+            elif convrot_target:
+                candidate = basic_candidate
+            else:
+                candidate = can_quantize_weight(
+                    k, v, protected_substrings=(), alignment=quant_alignment
+                )
+
+            if candidate:
                 base_k_file = k.replace(".weight", "")
                 base_k_meta = base_k_file
 
@@ -482,26 +549,76 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     log(f"FP8: {k}")
                     weight_scale = (v_tensor.abs().max() / 448.0).clamp(min=1e-12).float()
                     weight_quantized = ck.quantize_per_tensor_fp8(v_tensor, weight_scale)
-                    new_sd[k] = weight_quantized.cpu()
-                    new_sd[f"{base_k_file}.weight_scale"] = weight_scale.to(torch.bfloat16).cpu()
+                    stored_weight = weight_quantized.cpu()
+                    stored_scale = weight_scale.to(torch.bfloat16).cpu()
                     layer_conf = {"format": "float8_e4m3fn"}
-                    new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
+                    comfy_tensor = encode_quant_config(layer_conf)
+                    new_sd[k] = stored_weight
+                    new_sd[f"{base_k_file}.weight_scale"] = stored_scale
+                    new_sd[f"{base_k_file}.comfy_quant"] = comfy_tensor
                     quant_map["layers"][base_k_meta] = layer_conf
                     counts["fp8"] += 1
+                    coverage_bytes["fp8"] += source_tensor_bytes
+                    coverage_bytes["fp8 stored"] += (
+                        tensor_nbytes(stored_weight)
+                        + tensor_nbytes(stored_scale)
+                        + tensor_nbytes(comfy_tensor)
+                    )
                     if device == "cuda":
                         del v_tensor
                     continue
 
-                int8_convrot = target_format == "int8_convrot"
-                int4_convrot = target_format == "int4_convrot"
-                w4a8_convrot = target_format == "w4a8_convrot"
-                if target_format in ("int8", "int8_convrot"):
+                requested_int8_convrot = target_format == "int8_convrot"
+                requested_int4_convrot = target_format == "int4_convrot"
+                requested_w4a8_convrot = target_format == "w4a8_convrot"
+                layer_format = target_format
+                layer_gs = best_convrot_groupsize(v.size(1)) if convrot_target else None
+
+                # ConvRot rotates K (in_features), not N.  The previous converter
+                # required both dimensions to satisfy one global alignment, which
+                # left many otherwise valid layers in BF16.  Follow the current
+                # comfy-model-tools policy more closely: pick the largest supported
+                # ConvRot group per layer and only apply format-specific constraints.
+                if requested_int8_convrot:
+                    if layer_gs is None or v.size(0) < 8:
+                        layer_format = None
+                elif requested_int4_convrot:
+                    if layer_gs is None or v.size(0) < 8:
+                        layer_format = None
+                    elif v.size(1) % INT4_QUANT_GROUPSIZE != 0:
+                        layer_format = "int8_convrot_fallback"
+                elif requested_w4a8_convrot:
+                    # Current Comfy model tools use W4A8 when K is divisible by
+                    # 256 and N>=64, otherwise they fall back to INT8 ConvRot.
+                    if v.size(1) % CONVROT_GROUPSIZE != 0 or v.size(0) < 64:
+                        layer_format = "int8_convrot_fallback" if layer_gs is not None and v.size(0) >= 8 else None
+
+                if layer_format is None:
+                    new_sd[k], count_name = preserve_tensor(v, source_kind)
+                    counts[count_name] += 1
+                    reason_counts["convrot shape kept"] += 1
+                    coverage_bytes["convrot shape kept"] += source_tensor_bytes
+                    del v_tensor
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
+                    continue
+
+                def quantize_as_int8_convrot(ready_tensor, group_size):
+                    return TensorWiseINT8Layout.quantize(
+                        ready_tensor,
+                        is_weight=True,
+                        per_channel=True,
+                        convrot=True,
+                        convrot_groupsize=group_size,
+                    )
+
+                if layer_format in ("int8", "int8_convrot", "int8_convrot_fallback"):
                     layout = TensorWiseINT8Layout
                     fmt_name = "int8_tensorwise"
-                elif int4_convrot:
+                elif layer_format == "int4_convrot":
                     layout = TensorCoreConvRotW4A4Layout
                     fmt_name = "convrot_w4a4"
-                elif w4a8_convrot:
+                elif layer_format == "w4a8_convrot":
                     layout = AsymW4A8Int8Layout
                     fmt_name = "asym_w4a8_int8"
                 elif target_format == "mxfp8":
@@ -510,23 +627,26 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 else:
                     layout = TensorCoreNVFP4Layout
                     fmt_name = "nvfp4"
-                log(f"{target_format.upper()}: {k}")
+
+                log_label = layer_format.upper().replace("_FALLBACK", " FALLBACK")
+                log(f"{log_label}: {k}" + (f" (gs={layer_gs})" if layer_gs else ""))
 
                 qdata = params = tensors = v_tensor_ready = None
+                used_format = layer_format
                 try:
                     # Do not cast to float32 here: recent Forge kernels reject it
                     # ("Unsupported dtype code: 0") and the temporary FP32 copy can
                     # exhaust VRAM on large DiTs.
                     v_tensor_ready = v_tensor.contiguous()
-                    if int8_convrot:
-                        qdata, params = layout.quantize(v_tensor_ready, per_channel=True, convrot=True, convrot_groupsize=CONVROT_GROUPSIZE)
-                    elif int4_convrot:
+                    if layer_format in ("int8_convrot", "int8_convrot_fallback"):
+                        qdata, params = quantize_as_int8_convrot(v_tensor_ready, layer_gs)
+                    elif layer_format == "int4_convrot":
                         qdata, params = layout.quantize(
                             v_tensor_ready,
-                            convrot_groupsize=CONVROT_GROUPSIZE,
+                            convrot_groupsize=layer_gs,
                             quant_group_size=INT4_QUANT_GROUPSIZE,
                         )
-                    elif w4a8_convrot:
+                    elif layer_format == "w4a8_convrot":
                         qdata, params = layout.quantize(
                             v_tensor_ready,
                             group_size=W4A8_QUANT_GROUPSIZE,
@@ -538,34 +658,67 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                             qdata, params = layout.quantize(v_tensor_ready)
                     else:
                         qdata, params = layout.quantize(v_tensor_ready)
+                except Exception as primary_error:
+                    # If a 4-bit backend rejects a layer, use the proven INT8
+                    # ConvRot path instead of silently bloating the output with BF16.
+                    if layer_format in ("int4_convrot", "w4a8_convrot") and layer_gs is not None and v.size(0) >= 8:
+                        log(
+                            f"Warning: {layer_format} failed for {k}: {primary_error}; "
+                            f"trying INT8 ConvRot fallback (gs={layer_gs})"
+                        )
+                        try:
+                            layout = TensorWiseINT8Layout
+                            fmt_name = "int8_tensorwise"
+                            qdata, params = quantize_as_int8_convrot(v_tensor_ready, layer_gs)
+                            used_format = "int8_convrot_fallback"
+                        except Exception as fallback_error:
+                            log(f"Warning: INT8 ConvRot fallback also failed for {k}: {fallback_error}")
+                            new_sd[k], count_name = preserve_tensor(v, source_kind)
+                            counts[count_name] += 1
+                            reason_counts["quantization failed kept"] += 1
+                            coverage_bytes["quantization failed kept"] += source_tensor_bytes
+                            qdata = params = None
+                    else:
+                        log(f"Warning: quantization failed for {k}: {primary_error}")
+                        new_sd[k], count_name = preserve_tensor(v, source_kind)
+                        counts[count_name] += 1
+                        reason_counts["quantization failed kept"] += 1
+                        coverage_bytes["quantization failed kept"] += source_tensor_bytes
+                        qdata = params = None
 
+                if qdata is not None:
                     tensors = layout.state_dict_tensors(qdata, params)
+                    stored_bytes = 0
                     for suffix, tensor in tensors.items():
                         out_key = f"{base_k_file}.weight{suffix}"
                         if FLOAT8_E8M0 is not None and tensor.dtype == FLOAT8_E8M0:
-                            new_sd[out_key] = tensor.view(torch.uint8).cpu()
+                            stored = tensor.view(torch.uint8).cpu()
                         elif tensor.dtype in FP8_DTYPES:
-                            new_sd[out_key] = tensor.view(torch.uint8).cpu().view(tensor.dtype)
+                            stored = tensor.view(torch.uint8).cpu().view(tensor.dtype)
                         else:
-                            new_sd[out_key] = tensor.cpu()
+                            stored = tensor.cpu()
+                        new_sd[out_key] = stored
+                        stored_bytes += tensor_nbytes(stored)
 
                     layer_conf = {"format": fmt_name}
-                    if int8_convrot:
+                    if used_format in ("int8_convrot", "int8_convrot_fallback"):
                         layer_conf["convrot"] = True
-                        layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
-                    elif int4_convrot:
-                        layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
+                        layer_conf["convrot_groupsize"] = layer_gs
+                    elif used_format == "int4_convrot":
+                        layer_conf["convrot_groupsize"] = layer_gs
                         layer_conf["quant_group_size"] = INT4_QUANT_GROUPSIZE
-                    elif w4a8_convrot:
+                    elif used_format == "w4a8_convrot":
                         layer_conf["group_size"] = W4A8_QUANT_GROUPSIZE
                         layer_conf["convrot_groupsize"] = CONVROT_GROUPSIZE
-                    new_sd[f"{base_k_file}.comfy_quant"] = encode_quant_config(layer_conf)
+
+                    comfy_tensor = encode_quant_config(layer_conf)
+                    new_sd[f"{base_k_file}.comfy_quant"] = comfy_tensor
+                    stored_bytes += tensor_nbytes(comfy_tensor)
                     quant_map["layers"][base_k_meta] = layer_conf
-                    counts[target_format] += 1
-                except Exception as e:
-                    log(f"Warning: quantization failed for {k}: {e}")
-                    new_sd[k], count_name = preserve_tensor(v, source_kind)
-                    counts[count_name] += 1
+                    count_key = "int8_convrot fallback" if used_format == "int8_convrot_fallback" else used_format
+                    counts[count_key] += 1
+                    coverage_bytes[count_key] += source_tensor_bytes
+                    coverage_bytes[f"{count_key} stored"] += stored_bytes
 
                 # Explicitly drop all CUDA temporaries before the next layer.  The
                 # quantization layouts can allocate several working buffers, so
@@ -576,6 +729,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
             else:
                 new_sd[k], count_name = preserve_tensor(v, source_kind)
                 counts[count_name] += 1
+                coverage_bytes["kept non-candidate"] += source_tensor_bytes
 
     final_metadata = OrderedDict(temp_diffusers_meta)
     if quant_map["layers"]:
@@ -591,6 +745,63 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     duration = time.time() - start_time
     reduction = (1 - output_bytes / input_bytes) * 100 if input_bytes else 0
     layers_desc = ", ".join(f"{n} {name}" for name, n in counts.most_common())
+    if target_format not in ("fp16", "fp32"):
+        quantized_coverage_names = tuple(
+            dict.fromkeys((target_format, "fp8", "int8_convrot fallback"))
+        )
+        coverage_parts = []
+        for name in (
+            *quantized_coverage_names,
+            "convrot shape kept",
+            "quantization failed kept",
+            "kept by profile",
+            "kept by global protection",
+            "kept non-candidate",
+        ):
+            num_bytes = coverage_bytes.get(name, 0)
+            if num_bytes:
+                coverage_parts.append(f"{name}: {format_size(num_bytes)} source")
+        if coverage_parts:
+            log("Quantization coverage | " + " | ".join(coverage_parts))
+        storage_parts = []
+        for name in quantized_coverage_names:
+            source_num = coverage_bytes.get(name, 0)
+            stored_num = coverage_bytes.get(f"{name} stored", 0)
+            if source_num and stored_num:
+                storage_parts.append(f"{name}: {format_size(source_num)} -> {format_size(stored_num)}")
+        if storage_parts:
+            log("Quantized storage | " + " | ".join(storage_parts))
+        if profile_keep_bytes:
+            breakdown = " | ".join(
+                f"{name}: {format_size(num_bytes)}"
+                for name, num_bytes in profile_keep_bytes.most_common(8)
+            )
+            log(f"Kept by profile breakdown | {breakdown}")
+        if global_keep_bytes:
+            breakdown = " | ".join(
+                f"{name}: {format_size(num_bytes)}"
+                for name, num_bytes in global_keep_bytes.most_common(8)
+            )
+            log(f"Kept by global protection breakdown | {breakdown}")
+
+        quantized_source_bytes = sum(
+            coverage_bytes.get(name, 0)
+            for name in quantized_coverage_names
+        )
+        if matrix_source_bytes:
+            matrix_coverage = 100.0 * quantized_source_bytes / matrix_source_bytes
+            log(
+                f"Matrix quantization coverage | {format_size(quantized_source_bytes)} / "
+                f"{format_size(matrix_source_bytes)} = {matrix_coverage:.1f}%"
+            )
+            if matrix_coverage < 70.0:
+                log(
+                    "WARNING: Less than 70% of 2D floating-point weight bytes were quantized. "
+                    "Check the profile/global-protection breakdown before trusting the output size."
+                )
+        if reason_counts:
+            reasons = ", ".join(f"{n} {name}" for name, n in reason_counts.most_common())
+            log(f"ConvRot fallbacks/kept: {reasons}")
     status = "\n".join(
         [
             f"Success ({active_model_type} -> {target_format})",
