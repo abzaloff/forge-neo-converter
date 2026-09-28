@@ -61,6 +61,119 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(core.can_quantize_weight(key, tensor))
         self.assertTrue(core.can_quantize_weight(key, tensor, protected_substrings=()))
 
+    def test_fp8_coverage_reports_quantized_bytes_without_false_warning(self):
+        state_dict = {
+            "blocks.0.linear.weight": torch.ones((64, 64), dtype=torch.float16),
+        }
+        logs = []
+        fake_ck = types.SimpleNamespace(
+            quantize_per_tensor_fp8=lambda tensor, _scale: tensor.to(torch.int8)
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "model-fp16.safetensors")
+            safetensors.torch.save_file(state_dict, source)
+
+            with mock.patch.object(core, "ck", fake_ck):
+                core.convert_model(
+                    source,
+                    "Other/Unknown",
+                    "fp8",
+                    "cpu",
+                    log=logs.append,
+                )
+
+        coverage_logs = [
+            line for line in logs if line.startswith("Matrix quantization coverage")
+        ]
+        self.assertEqual(len(coverage_logs), 1, logs)
+        self.assertIn("= 100.0%", coverage_logs[0])
+        self.assertFalse(
+            any("Less than 70% of 2D floating-point weight bytes" in line for line in logs),
+            logs,
+        )
+
+    def test_convrot_group_selection_prefers_256_then_64_then_16(self):
+        self.assertEqual(core.best_convrot_groupsize(512), 256)
+        self.assertEqual(core.best_convrot_groupsize(192), 64)
+        self.assertEqual(core.best_convrot_groupsize(80), 16)
+        self.assertIsNone(core.best_convrot_groupsize(24))
+
+    def test_int4_and_w4a8_backend_failures_fall_back_to_int8_convrot(self):
+        class FailingLayout:
+            @staticmethod
+            def quantize(_tensor, **_kwargs):
+                raise RuntimeError("synthetic quantization failure")
+
+        for target_format, primary_layout_name in (
+            ("int4_convrot", "TensorCoreConvRotW4A4Layout"),
+            ("w4a8_convrot", "AsymW4A8Int8Layout"),
+        ):
+            with self.subTest(target_format=target_format):
+                state_dict = {
+                    "blocks.0.linear.weight": torch.ones(
+                        (64, 256), dtype=torch.float16
+                    ),
+                }
+                logs = []
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    source = os.path.join(temp_dir, "model-fp16.safetensors")
+                    safetensors.torch.save_file(state_dict, source)
+
+                    with (
+                        mock.patch.object(core, "ck", object()),
+                        mock.patch.object(core, "TensorWiseINT8Layout", DummyInt8Layout),
+                        mock.patch.object(core, primary_layout_name, FailingLayout),
+                    ):
+                        _, output = core.convert_model(
+                            source,
+                            "Other/Unknown",
+                            target_format,
+                            "cpu",
+                            log=logs.append,
+                        )
+
+                    with safetensors.safe_open(output, framework="pt") as handle:
+                        metadata = handle.metadata()
+
+                quantization = json.loads(metadata["_quantization_metadata"])
+                layer_conf = quantization["layers"]["blocks.0.linear"]
+                self.assertEqual(layer_conf["format"], "int8_tensorwise")
+                self.assertTrue(layer_conf["convrot"])
+                self.assertEqual(layer_conf["convrot_groupsize"], 256)
+                self.assertTrue(
+                    any("trying INT8 ConvRot fallback" in line for line in logs),
+                    logs,
+                )
+
+    def test_seedvr_proj_out_override_is_limited_to_convrot_targets(self):
+        configs = core.load_model_configs()
+
+        for target_format in (
+            "int8_convrot",
+            "int4_convrot",
+            "w4a8_convrot",
+        ):
+            with self.subTest(target_format=target_format):
+                blacklist, _, _, override = core.get_profile(
+                    configs,
+                    "SeedVR (All Versions)",
+                    target_format=target_format,
+                )
+                self.assertNotIn("proj_out", blacklist)
+                self.assertEqual(override.get("blacklist_remove"), ["proj_out"])
+
+        for target_format in ("fp8", "int8", "mxfp8", "nvfp4", "fp16", "fp32"):
+            with self.subTest(target_format=target_format):
+                blacklist, _, _, override = core.get_profile(
+                    configs,
+                    "SeedVR (All Versions)",
+                    target_format=target_format,
+                )
+                self.assertIn("proj_out", blacklist)
+                self.assertEqual(override, {})
+
     def test_high_precision_streaming_does_not_load_full_state_dict(self):
         state_dict = {
             "layer.weight": torch.ones((16, 16), dtype=torch.float16),
