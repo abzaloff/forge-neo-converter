@@ -45,6 +45,7 @@ INT4_QUANT_GROUPSIZE = 64
 W4A8_QUANT_GROUPSIZE = 16
 # FNC_W6A8_EXPERIMENT_V1
 W6A8_QUANT_GROUPSIZE = 32
+W6A8_MIN_OUT_FEATURES = 64
 FORGE_SENSITIVE_SUBSTRINGS = (
     "embed",
     "bias",
@@ -142,7 +143,9 @@ def keep_tensor_dtype(tensor):
     return tensor
 
 
-def preserve_tensor(tensor, source_kind):
+def preserve_tensor(tensor, source_kind, preserve_source_dtype=False):
+    if preserve_source_dtype:
+        return tensor, "kept"
     if source_kind == "text_encoder" and tensor.dtype.is_floating_point:
         return tensor.to(dtype=torch.bfloat16), "kept bf16"
     return keep_tensor_dtype(tensor), "kept"
@@ -447,18 +450,19 @@ def _probe_w6a8(device, log):
     # Do not install/upgrade packages or silently export INT4 on old kernels.
     try:
         from comfy_kitchen.tensor import QuantizedTensor
-        probe = (torch.randn(256, 256, generator=torch.Generator(device="cpu").manual_seed(1234)) * 0.05).to(device=device, dtype=torch.bfloat16)
-        q, p = _w6a8_quantize(probe)
-        state = AsymW4A8Int8Layout.state_dict_tensors(q, p)
-        if not {"", "_s_rel", "_s_channel"}.issubset(state):
-            raise RuntimeError("Missing canonical W6A8 checkpoint tensors")
-        restored = QuantizedTensor(q, "AsymW4A8Int8Layout", p).dequantize().float()
-        if restored.shape != probe.shape or not torch.isfinite(restored).all().item():
-            raise RuntimeError("W6A8 dequantization probe returned invalid values")
-        error = ((restored - probe.float()).norm() / probe.float().norm()).item() * 100
-        if not 0 <= error < 15:
-            raise RuntimeError(f"Unexpected W6A8 probe relative error: {error:.2f}%")
-        log(f"W6A8 preflight OK: 6-bit packed weights, group=32, ConvRot=256, relative error={error:.3f}%")
+        for n, k in ((256, 256), (128, 256), (64, 256)):
+            probe = (torch.randn(n, k, generator=torch.Generator(device="cpu").manual_seed(1234)) * 0.05).to(device=device, dtype=torch.bfloat16)
+            q, p = _w6a8_quantize(probe)
+            state = AsymW4A8Int8Layout.state_dict_tensors(q, p)
+            if not {"", "_s_rel", "_s_channel"}.issubset(state):
+                raise RuntimeError("Missing canonical W6A8 checkpoint tensors")
+            restored = QuantizedTensor(q, "AsymW4A8Int8Layout", p).dequantize().float()
+            if restored.shape != probe.shape or not torch.isfinite(restored).all().item():
+                raise RuntimeError("W6A8 dequantization probe returned invalid values")
+            error = ((restored - probe.float()).norm() / probe.float().norm()).item() * 100
+            if not 0 <= error < 15:
+                raise RuntimeError(f"Unexpected W6A8 probe relative error: {error:.2f}%")
+            log(f"W6A8 preflight OK: {n}x{k}, 6-bit packed weights, group=32, ConvRot=256, relative error={error:.3f}%")
     except Exception as exc:
         raise RuntimeError(f"Native W6A8 is unavailable on {device} in the installed comfy-kitchen: {exc}. No output written; no dependencies changed.") from exc
 
@@ -484,6 +488,12 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     blacklist, fp8_layers, preserve_extended, target_override = get_profile(
         configs, active_model_type, target_format=target_format
     )
+    # Opt-in per-profile allowlist and dtype preservation. Existing profiles
+    # intentionally retain their original selection and preservation policy.
+    profile_options = configs["models"].get(active_model_type, {})
+    key_pattern = profile_options.get("quantize_key_regex")
+    quantize_key_regex = re.compile(key_pattern) if key_pattern else None
+    preserve_source_dtype = profile_options.get("preserve_source_dtype", False)
     protected_substrings = () if source_kind == "text_encoder" else FORGE_SENSITIVE_SUBSTRINGS
     source_label = "Text encoder" if source_kind == "text_encoder" else "Model"
     start_time = time.time()
@@ -506,6 +516,11 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
 
     input_bytes = os.path.getsize(model_path)
     input_plan = inspect_streaming_input(model_path, log=log)
+    if quantize_key_regex is not None and target_format not in ("fp16", "fp32"):
+        if not any(quantize_key_regex.fullmatch(key) for key in input_plan.keys):
+            raise ValueError(f"No recognized diffusion block weights for {active_model_type}. "
+                             "Select a native single-file diffusion checkpoint. No output written.")
+        log("Profile policy: main block weights only; other tensors retain source precision.")
     orig_meta = input_plan.metadata
 
     temp_diffusers_meta = OrderedDict()
@@ -529,7 +544,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
     total = len(input_plan.keys)
     mxfp8_backend = pick_mxfp8_backend(device, log=log) if target_format == "mxfp8" else None
     convrot_target = target_format in ("int8_convrot", "int4_convrot", "w4a8_convrot")
-    quant_alignment = CONVROT_GROUPSIZE if target_format == "w6a8_convrot" else 16
+    quant_alignment = 16
 
     if target_format in ("fp16", "fp32"):
         target_dtype = torch.float16 if target_format == "fp16" else torch.float32
@@ -556,8 +571,10 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 matrix_source_bytes += source_tensor_bytes
 
             matched_profile_rule = next((name for name in blacklist if name in k), None)
+            if quantize_key_regex is not None and not quantize_key_regex.fullmatch(k):
+                matched_profile_rule = "outside main block allowlist"
             if matched_profile_rule is not None:
-                new_sd[k], count_name = preserve_tensor(v, source_kind)
+                new_sd[k], count_name = preserve_tensor(v, source_kind, preserve_source_dtype)
                 counts[count_name] += 1
                 coverage_bytes["kept by profile"] += source_tensor_bytes
                 profile_keep_bytes[matched_profile_rule] += source_tensor_bytes
@@ -565,7 +582,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
 
             matched_global_rule = next((name for name in protected_substrings if name in k), None)
             if matched_global_rule is not None:
-                new_sd[k], count_name = preserve_tensor(v, source_kind)
+                new_sd[k], count_name = preserve_tensor(v, source_kind, preserve_source_dtype)
                 counts[count_name] += 1
                 coverage_bytes["kept by global protection"] += source_tensor_bytes
                 global_keep_bytes[matched_global_rule] += source_tensor_bytes
@@ -574,7 +591,7 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
             basic_candidate = is_quantizable_weight(k, v, protected_substrings=())
             if target_format in ("fp8", "int8"):
                 candidate = basic_candidate
-            elif convrot_target:
+            elif convrot_target or target_format == "w6a8_convrot":
                 candidate = basic_candidate
             else:
                 candidate = can_quantize_weight(
@@ -637,8 +654,15 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                     if v.size(1) % CONVROT_GROUPSIZE != 0 or v.size(0) < 64:
                         layer_format = "int8_convrot_fallback" if layer_gs is not None and v.size(0) >= 8 else None
 
+                elif target_format == "w6a8_convrot":
+                    # K is the rotated input width. N only has the conservative
+                    # minimum used by upstream comfy-model-tools, not K alignment.
+                    if (v.size(1) < CONVROT_GROUPSIZE or v.size(1) % CONVROT_GROUPSIZE != 0
+                            or v.size(0) < W6A8_MIN_OUT_FEATURES):
+                        layer_format = None
+
                 if layer_format is None:
-                    new_sd[k], count_name = preserve_tensor(v, source_kind)
+                    new_sd[k], count_name = preserve_tensor(v, source_kind, preserve_source_dtype)
                     counts[count_name] += 1
                     reason_counts["convrot shape kept"] += 1
                     coverage_bytes["convrot shape kept"] += source_tensor_bytes
@@ -724,14 +748,14 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                             used_format = "int8_convrot_fallback"
                         except Exception as fallback_error:
                             log(f"Warning: INT8 ConvRot fallback also failed for {k}: {fallback_error}")
-                            new_sd[k], count_name = preserve_tensor(v, source_kind)
+                            new_sd[k], count_name = preserve_tensor(v, source_kind, preserve_source_dtype)
                             counts[count_name] += 1
                             reason_counts["quantization failed kept"] += 1
                             coverage_bytes["quantization failed kept"] += source_tensor_bytes
                             qdata = params = None
                     else:
                         log(f"Warning: quantization failed for {k}: {primary_error}")
-                        new_sd[k], count_name = preserve_tensor(v, source_kind)
+                        new_sd[k], count_name = preserve_tensor(v, source_kind, preserve_source_dtype)
                         counts[count_name] += 1
                         reason_counts["quantization failed kept"] += 1
                         coverage_bytes["quantization failed kept"] += source_tensor_bytes
@@ -780,12 +804,16 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
                 if device == "cuda":
                     torch.cuda.empty_cache()
             else:
-                new_sd[k], count_name = preserve_tensor(v, source_kind)
+                new_sd[k], count_name = preserve_tensor(v, source_kind, preserve_source_dtype)
                 counts[count_name] += 1
                 coverage_bytes["kept non-candidate"] += source_tensor_bytes
 
     if target_format == "w6a8_convrot" and not counts["w6a8_convrot"]:
         raise RuntimeError("No compatible W6A8 layers were converted. No output written.")
+
+    if (quantize_key_regex is not None and target_format not in ("fp16", "fp32")
+            and not quant_map["layers"]):
+        raise RuntimeError(f"No compatible layers were converted for {active_model_type}. No output written.")
 
     final_metadata = OrderedDict(temp_diffusers_meta)
     if quant_map["layers"]:
