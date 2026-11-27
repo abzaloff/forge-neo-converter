@@ -557,6 +557,13 @@ class UiTests(unittest.TestCase):
                 if component["type"] == "tabitem"
             }
             self.assertEqual(tab_labels, {"Model mode", "Text encoder mode"})
+            model_dropdown = next(c for c in config["components"]
+                                  if c["props"].get("elem_id") == "forge_neo_converter_model_type")
+            choices = [value for _, value in model_dropdown["props"]["choices"]]
+            self.assertIn("MOSS", choices)
+            self.assertIn("MiniMax H3", choices)
+            self.assertNotIn("Text-Encoder", choices)
+            self.assertEqual(model_dropdown["props"]["value"], "Flux1 / Flux2")
 
     def test_ui_recovers_from_stale_cached_core_module(self):
         stale_core = types.ModuleType("forge_neo_converter_core")

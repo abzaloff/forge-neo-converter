@@ -64,6 +64,22 @@
       "fp8_layers": [],
       "preserve_extended_metadata": true
     },
+    "MiniMax H3": {
+      "_note": "Native ComfyUI MiniMax H3 video and H3 Image diffusion checkpoints. Quantize main DiT attention/MLP linears only. Keep AdaLN curves, modulation, token refiner, conditioning and output projections in source precision.",
+      "blacklist": [],
+      "fp8_layers": [],
+      "preserve_extended_metadata": true,
+      "preserve_source_dtype": true,
+      "quantize_key_regex": "(?:model\\.diffusion_model\\.|diffusion_model\\.)?blocks\\.[0-9]+\\.(?:attn\\.(?:qkv_proj|out_proj)|mlp\\.(?:fc1|fc2))\\.weight"
+    },
+    "MOSS": {
+      "_note": "MOSS-Image Base/SFT/Turbo native DiT. Quantize block projections only, supporting fused qkv and separate q/k/v. Keep conditioning, modulation, norms, final projection and RoPE in source precision.",
+      "blacklist": [],
+      "fp8_layers": [],
+      "preserve_extended_metadata": true,
+      "preserve_source_dtype": true,
+      "quantize_key_regex": "(?:model\\.diffusion_model\\.|diffusion_model\\.)?layers\\.[0-9]+\\.proj\\.(?:qkv|q|k|v|o|ffn_up_gate|ffn_down)\\.weight"
+    },
     "Qwen-Image": {
       "_note": "Groups Qwen-Image-Edit-2511 and 2512.",
       "blacklist": ["img_in", "txt_in", "time_text_embed", "norm_out", "proj_out", "img_mod.1"],
